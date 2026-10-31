@@ -21,6 +21,7 @@ import java.io.File
 import java.io.InputStream
 import java.security.DigestInputStream
 import java.security.MessageDigest
+import java.time.Instant
 
 /**
  * BitChord ships as a sideloaded APK off GitHub Releases rather than through
@@ -55,6 +56,16 @@ object AppUpdateChecker {
     private const val LATEST_RELEASE_URL =
         "https://api.github.com/repos/kushagrasinghx/BitChord/releases/latest"
 
+    /**
+     * Releases published at or after this instant must ship a checksum
+     * manifest (`<prefix>SHA256SUMS.txt`) for their APK to be offered for
+     * in-app install; older releases predate the convention and stay
+     * verifiable-when-present. Bump only with a CI change to publish
+     * manifests, and only once one release has cut over.
+     */
+    private val MANIFEST_REQUIRED_ON_OR_AFTER: Instant =
+        Instant.parse("2026-12-01T00:00:00Z")
+
     /** The release's `<prefix>SHA256SUMS.txt` asset holds digests for every APK of this flavour. */
     private const val SHA_SUMS_SUFFIX = "SHA256SUMS.txt"
 
@@ -87,12 +98,24 @@ object AppUpdateChecker {
             val release = json.parseToJsonElement(body) as? JsonObject ?: return@runCatching
             val tag = release["tag_name"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
             val url = release["html_url"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
+            val publishedAt = release["published_at"]?.jsonPrimitive?.contentOrNull
+                ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+            // Releases published before the checksum-manifest convention keep
+            // the old behaviour (verify when a manifest exists); anything from
+            // on or after the cutoff **must** carry a verifiable one or the
+            // in-app installer step is withheld — the dialog falls back to
+            // opening the releases page. A release missing even its
+            // `published_at` counts as legacy rather than blocking the
+            // updater entirely; GitHub always sets it for real releases.
+            val manifestMandatory = publishedAt != null &&
+                !publishedAt.isBefore(MANIFEST_REQUIRED_ON_OR_AFTER)
             val apkUrl = apkAssetUrl(release)
             val apkSha256 = shaSumsUrl(release)?.let { sums -> fetchSumsEntry(sums, apkUrl) }
             val notes = release["body"]?.jsonPrimitive?.contentOrNull
             val latest = tag.removePrefix("v")
             if (isNewer(latest, BuildConfig.VERSION_NAME)) {
-                _available.value = UpdateInfo(latest, url, apkUrl, notes, apkSha256)
+                val offering = if (manifestMandatory && apkSha256 == null) null else apkUrl
+                _available.value = UpdateInfo(latest, url, offering, notes, apkSha256)
             }
         }
     }
@@ -146,7 +169,7 @@ object AppUpdateChecker {
      * not ship one. With a manifest, downloads get verified; without, the
      * release pre-dates the manifest convention and behaves as before.
      */
-    private fun shaSumsUrl(release: JsonObject): String? = runCatching {
+    internal fun shaSumsUrl(release: JsonObject): String? = runCatching {
         val expected = "${BuildConfig.UPDATE_APK_PREFIX}$SHA_SUMS_SUFFIX"
         release["assets"]?.jsonArray
             ?.mapNotNull { it as? JsonObject }
@@ -162,31 +185,53 @@ object AppUpdateChecker {
 
     /**
      * The digest line for [apkUrl] inside the manifest at [sumsUrl], lower
-     * cased; null when the entry is missing or malformed.
+     * cased; null when the entry is missing, duplicated with inconsistent
+     * hashes, or the manifest is malformed.
      */
-    private fun fetchSumsEntry(sumsUrl: String, apkUrl: String?): String? {
+    internal fun fetchSumsEntry(sumsUrl: String, apkUrl: String?): String? {
         if (apkUrl == null) return null
         return runCatching {
             val request = Request.Builder().url(sumsUrl).build()
             val body = Http.client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) null else response.body?.string()
             } ?: return null
-            val fileName = apkUrl.substringAfterLast('/')
-            // Lines are `<hex>  <name>` (two spaces, the sha256sum convention);
-            // `-r` style comparisons stay exact on the file name.
-            body.lineSequence()
-                .firstOrNull { line ->
-                    val idx = line.indexOf("  ")
-                    idx > 0 && line.substring(idx + 2).trim() == fileName
-                }
-                ?.substringBefore("  ")
-                ?.trim()
-                ?.takeIf {
-                    it.length == 64 && it.all { c -> c.isDigit() || c.lowercaseChar() in 'a'..'f' }
-                }
-                ?.lowercase()
+            parseSumsEntry(body, apkUrl.substringAfterLast('/'))
         }.getOrNull()
     }
+
+    /**
+     * Picks [fileName]'s digest out of a `sha256sum`-style manifest body.
+     *
+     * Accepted line shape, text and binary (` *`) marker style alike:
+     *
+     *     <64 hex chars><one space><optional '*'><file name>
+     *
+     * Blank and comment lines simply do not match; anything the pattern does
+     * not anchor onto disqualifies that line. A file name appearing twice with
+     * different digests means somebody edited the manifest — reject instead of
+     * trusting a coin toss. CRLF manifests are handled by the pattern itself.
+     */
+    internal fun parseSumsEntry(body: String, fileName: String): String? {
+        if (fileName.isEmpty()) return null
+        val matches = SHA_LINE.findAll(body)
+            .mapNotNull { m ->
+                val hash = m.groupValues[1].lowercase()
+                val name = m.groupValues[2].trim()
+                if (name != fileName) null else hash
+            }
+            .toSet()
+        return matches.singleOrNull()?.takeIf { isHexDigest64(it) }
+    }
+
+    // Anchored on line starts so a dotted 128-char joke hex string cannot let
+    // an entry's tail be "parsed" as the digest for a name it does not own.
+    // GNU coreutils emits "<hash>  <name>" in text mode and "<hash> *<name>"
+    // with -b; the pattern accepts exactly one separator column, which makes
+    // the space the format requires and the optional binary marker explicit.
+    private val SHA_LINE = Regex("(?m)^\\s*([0-9a-fA-F]{64}) [ *]([^\\r\\n]+)$")
+
+    private fun isHexDigest64(raw: String): Boolean = raw.length == 64 &&
+        raw.all { c -> c.isDigit() || c.lowercaseChar() in 'a'..'f' }
 
     /**
      * Streams the current update's APK into the app cache, reporting progress
@@ -237,10 +282,16 @@ object AppUpdateChecker {
 
             // The release manifest publishes what the APK's bytes should hash
             // to. A mismatch means the download was tampered with or truncated
-            // somewhere between GitHub and here — refuse it rather than hand
-            // it to the installer.
+            // somewhere between GitHub and here — discard the file and refuse
+            // to offer Install Now rather than hand it to the installer.
             info.apkSha256?.let { expected ->
-                verifyDigest(digest, expected)
+                if (!digestMatches(digest, expected)) {
+                    target.delete()
+                    _download.value = DownloadState.Failed(
+                        "Update APK failed its integrity check; download discarded, nothing installed.",
+                    )
+                    return@withContext
+                }
             }
             _download.value = DownloadState.Ready(target)
         }.onFailure { error ->
@@ -252,14 +303,12 @@ object AppUpdateChecker {
         }
     }
 
-    private fun verifyDigest(digest: MessageDigest, expectedHex: String) {
+    private fun digestMatches(digest: MessageDigest, expectedHex: String): Boolean {
+        // Only SHA-256 manifests are trusted, so the expected value's format is
+        // checked by fetchSumsEntry before it gets here.
         val actual = digest.digest().joinToString("") { "%02x".format(it) }
-        // Constant-time handshake despite hex being inputs we fetched.
-        if (!MessageDigest.isEqual(actual.toByteArray(), expectedHex.lowercase().toByteArray())) {
-            throw IllegalStateException(
-                "Update APK failed its integrity check; the file was deleted and nothing was installed.",
-            )
-        }
+        // Constant-time handshake even though both sides are strings we built.
+        return MessageDigest.isEqual(actual.toByteArray(), expectedHex.lowercase().toByteArray())
     }
 
     private fun InputStream.digesting(digest: MessageDigest): InputStream =

@@ -8,10 +8,9 @@ import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.Song
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
@@ -20,10 +19,11 @@ import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 data class TvRemoteStatus(
     val isPlaying: Boolean,
@@ -35,8 +35,9 @@ data class TvRemoteStatus(
 )
 
 /**
- * OneTvServer session that returned from [TvAuthServer.start].
- * [code] is the pairing code the TV shows; every API call must echo it back.
+ * One [TvAuthServer] session as returned from [TvAuthServer.start].
+ * [code] is the pairing code the TV shows; state-changing calls have to
+ * carry it, and pairing itself starts the cookie-based session below.
  */
 data class TvServerSession(val port: Int, val ip: String, val code: String)
 
@@ -45,25 +46,52 @@ object TvAuthServer {
     private const val TAG = "TvAuthServer"
     private const val DEFAULT_PORT = 8765
 
-    /** Wrong-code tries accepted from one address before refusals, per window. */
+    /** Wrong-code tries accepted from one address before refusing it, per window. */
     private const val MAX_CODE_ATTEMPTS = 30
     private const val ATTEMPT_WINDOW_MS = 5 * 60 * 1000L
+
+    /** How long an address that burned its window stays refused. */
+    private const val THROTTLE_BAN_MS = 15 * 60 * 1000L
+
+    /**
+     * A pairing code stops being accepted this long after issue or refresh.
+     * The one thing it is worth is the cookie handoff; if nobody shows up in
+     * ten minutes a fresh one appears on screen.
+     */
+    private const val PAIRING_WINDOW_MS = 10 * 60 * 1000L
+
+    /** Cookie the paired browser uses for every subsequent remote call. */
+    internal const val SESSION_COOKIE_NAME = "bitchord_tv"
+
+    /** Lenient enough for browser quirks, strict enough not to be faked. */
+    private const val DIGITS = "0123456789"
+    private val HEX = "0123456789abcdef"
 
     private var serverSocket: ServerSocket? = null
     private val isRunning = AtomicBoolean(false)
     private val scope = CoroutineScope(Dispatchers.IO)
 
     /**
-     * Pairing code minted per [start]. Anything on the LAN can open the same
-     * port, so every state-changing call has to prove it was read off the TV
-     * screen; the browser which scanned the QR carries it around itself.
+     * The six-digit pairing code, minted fresh per [start], rotated when the
+     * pairing lands, and re-issued when one expires. The dialog watches this
+     * flow, so a rotation reaches the screen without hand-sync there.
      */
-    @Volatile
-    var pairingCode: String? = null
-        private set
+    val pairingCodeState = MutableStateFlow<String?>(null)
+
+    private var codeIssuedAtMs = 0L
+
+    /**
+     * Session token minted the moment pairing succeeds, held by the paired
+     * browser as an `HttpOnly` cookie and checked on every remote API call.
+     * This is the credential the remote page actually uses, so it never has
+     * to travel through a URL, and losing the TV screen's short-lived code
+     * does not lose the phone's remote session.
+     */
+    private val sessionToken = AtomicReference<String?>(null)
 
     /** Failed-code attempts per source address, to blunt brute force. */
     private val failedAttempts = ConcurrentHashMap<String, MutableList<Long>>()
+    private val failedBans = ConcurrentHashMap<String, Long>()
 
     // Remote callbacks
     var statusProvider: (() -> TvRemoteStatus)? = null
@@ -106,7 +134,6 @@ object TvAuthServer {
         stop()
 
         val ip = getLocalIpAddress() ?: return@withContext null
-        val code = newPairingCode()
         try {
             val socket = try {
                 ServerSocket(DEFAULT_PORT)
@@ -115,8 +142,10 @@ object TvAuthServer {
             }
             serverSocket = socket
             isRunning.set(true)
-            pairingCode = code
+            pairedReset()
             failedAttempts.clear()
+            failedBans.clear()
+            val code = rotateCode()
             val port = socket.localPort
 
             Thread {
@@ -143,38 +172,103 @@ object TvAuthServer {
             serverSocket?.close()
         } catch (_: Exception) {}
         serverSocket = null
-        pairingCode = null
+        pairedReset()
+        pairingCodeState.value = null
         failedAttempts.clear()
+        failedBans.clear()
     }
 
-    private fun newPairingCode(): String =
+    private fun pairedReset() {
+        sessionToken.set(null)
+        codeIssuedAtMs = 0L
+    }
+
+    internal fun newPairingCode(): String =
         // 6 digits from SecureRandom: short enough to read off a TV at room
         // distance, and the QR carries it too so the paired phone never has
         // to type it.
         buildString {
             val rng = SecureRandom()
-            repeat(6) { append('0' + rng.nextInt(10)) }
+            repeat(6) { append(DIGITS[rng.nextInt(DIGITS.length)]) }
         }
 
+    internal fun newSessionToken(): String =
+        // 128 bits of entropy: no enumeration, no timing dance worth
+        // attempting, and it doubles as the session cookie.
+        buildString {
+            val rng = SecureRandom()
+            repeat(32) { append(HEX[rng.nextInt(HEX.length)]) }
+        }
+
+    private fun rotateCode(): String {
+        codeIssuedAtMs = System.currentTimeMillis()
+        val code = newPairingCode()
+        pairingCodeState.value = code
+        return code
+    }
+
+    private fun isCodeFresh(): Boolean =
+        System.currentTimeMillis() - codeIssuedAtMs < PAIRING_WINDOW_MS
+
+    /** True while this address is serving out a URL-guessing ban. */
+    private fun isThrottled(client: Socket): Boolean {
+        val ip = client.inetAddress?.hostAddress ?: return false
+        val until = failedBans[ip] ?: return false
+        return System.currentTimeMillis() < until
+    }
+
     /**
-     * Verify the pairing code from a query or form body. Also keeps a rolling
-     * count of misses per source address so a LAN host cannot simply
-     * enumerate the digits; [MAX_CODE_ATTEMPTS] misses inside the window
-     * locks the address until the window slides past.
+     * Check the pairing code this request carries, only accepting one that is
+     * still inside its ten-minute window. A stale code is refused *and*
+     * rotated, so an expired grant can never be replayed by whoever is
+     * holding the old screen. [slideWindow] extends the deadline for the
+     * landing-page flow, where a user is mid-transfer when the check runs.
      */
-    private fun codeMatches(client: Socket, query: String, body: String): Boolean {
+    private fun pairingCodeMatches(
+        client: Socket,
+        query: String,
+        body: String,
+        slideWindow: Boolean = false,
+    ): Boolean {
+        if (isThrottled(client)) return false
+        val expected = pairingCodeState.value ?: return false
+        if (!isCodeFresh()) {
+            rotateCode()
+            return false
+        }
         val given = parseQueryParam(query, "code")
             ?: parseFormParam(body, "code")
             ?: return false
-        val expected = pairingCode ?: return false
         // Constant-time compare: codes are only 6 digits, but there is no
         // reason to leak their prefix to a timing probe.
         if (!MessageDigest.isEqual(expected.toByteArray(), given.toByteArray())) {
             noteFailure(client)
             return false
         }
+        if (slideWindow) codeIssuedAtMs = System.currentTimeMillis()
         return true
     }
+
+    /**
+     * The paired browser proves itself with the cookie minted at pairing,
+     * compared against the live token constant-time. Credentials ride in the
+     * header — never a URL, which would linger in browser history and in the
+     * server's (tiny) logs.
+     */
+    private fun sessionMatches(cookieHeader: String?): Boolean {
+        val token = sessionToken.get() ?: return false
+        val given = cookieHeader
+            ?.let { extractCookieValue(it, SESSION_COOKIE_NAME) }
+            ?: return false
+        return MessageDigest.isEqual(token.toByteArray(), given.toByteArray())
+    }
+
+    internal fun extractCookieValue(cookieHeader: String, name: String): String? =
+        cookieHeader.split(';').asSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("$name=") || it.startsWith("$name =") }
+            .map { it.substringAfter("=", "").trim() }
+            .firstOrNull { it.isNotEmpty() }
 
     private fun noteFailure(client: Socket) {
         val ip = client.inetAddress?.hostAddress ?: return
@@ -183,7 +277,12 @@ object TvAuthServer {
         synchronized(bucket) {
             bucket.removeAll { it < now - ATTEMPT_WINDOW_MS }
             bucket.add(now)
-            if (bucket.size > MAX_CODE_ATTEMPTS) bucket.clear()
+            if (bucket.size > MAX_CODE_ATTEMPTS) {
+                // A burner that keeps guessing gets to wait out a long ban
+                // instead of re-opening thirty tries every window forever.
+                bucket.clear()
+                failedBans[ip] = now + THROTTLE_BAN_MS
+            }
         }
     }
 
@@ -201,11 +300,14 @@ object TvAuthServer {
                 val query = if (rawPath.contains("?")) rawPath.substringAfter("?") else ""
 
                 var contentLength = 0
-                var line: String?
-                while (reader.readLine().also { line = it } != null) {
-                    if (line.isNullOrBlank()) break
-                    if (line!!.startsWith("Content-Length:", ignoreCase = true)) {
-                        contentLength = line!!.substringAfter(":").trim().toIntOrNull() ?: 0
+                var cookieHeader: String? = null
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    if (line.isBlank()) break
+                    if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                        contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
+                    } else if (line.startsWith("Cookie:", ignoreCase = true)) {
+                        cookieHeader = line.substringAfter(":").trim()
                     }
                 }
 
@@ -224,25 +326,31 @@ object TvAuthServer {
                 when {
                     // 1. API: Get Current Status
                     path == "/api/status" -> {
-                        if (!codeMatches(client, query, requestBody)) {
+                        if (!sessionMatches(cookieHeader)) {
                             sendJsonResponse(writer, """{"error":"unauthorized"}""")
                         } else {
                         val status = statusProvider?.invoke() ?: TvRemoteStatus(false, "No Song Playing", "BitChord TV", null, 0, 0)
-                        val json = JSONObject().apply {
-                            put("isPlaying", status.isPlaying)
-                            put("title", status.title)
-                            put("artist", status.artist)
-                            put("artworkUrl", status.artworkUrl ?: "")
-                            put("currentPositionMs", status.currentPositionMs)
-                            put("durationMs", status.durationMs)
+                        // Written by hand rather than through org.json: every
+                        // value here is a string from the media library, and
+                        // the escaping below is the only thing keeping a title
+                        // with a quote in it from breaking the page's JSON.
+                        val json = buildString {
+                            append("{")
+                            append("\"isPlaying\":").append(status.isPlaying).append(",")
+                            append("\"title\":").append(jsonString(status.title)).append(",")
+                            append("\"artist\":").append(jsonString(status.artist)).append(",")
+                            append("\"artworkUrl\":").append(jsonString(status.artworkUrl ?: "")).append(",")
+                            append("\"currentPositionMs\":").append(status.currentPositionMs).append(",")
+                            append("\"durationMs\":").append(status.durationMs)
+                            append("}")
                         }
-                        sendJsonResponse(writer, json.toString())
+                        sendJsonResponse(writer, json)
                         }
                     }
 
                     // 2. API: Control Playback Actions
                     path == "/api/action" -> {
-                        if (!codeMatches(client, query, requestBody)) {
+                        if (!sessionMatches(cookieHeader)) {
                             sendJsonResponse(writer, """{"error":"unauthorized"}""")
                         } else {
                         val action = if (method == "POST") {
@@ -269,7 +377,7 @@ object TvAuthServer {
 
                     // 3. API: Search Music from Phone
                     path == "/api/search" -> {
-                        if (!codeMatches(client, query, requestBody)) {
+                        if (!sessionMatches(cookieHeader)) {
                             sendJsonResponse(writer, """{"error":"unauthorized"}""")
                         } else {
                         val q = parseQueryParam(query, "q") ?: ""
@@ -278,20 +386,19 @@ object TvAuthServer {
                         } else {
                             scope.launch {
                                 val results = YtMusicRepository.search(q, SearchFilter.SONGS).getOrDefault(emptyList())
-                                val arr = JSONArray()
-                                results.take(15).forEach { item ->
-                                    val song = (item as? SearchResult.Track)?.song
-                                    if (song != null) {
-                                        val itemObj = JSONObject().apply {
-                                            put("videoId", song.videoId)
-                                            put("title", song.title)
-                                            put("subtitle", song.artist)
-                                            put("thumbnailUrl", song.thumbnailUrl ?: "")
+                                val rows = results.take(15).mapNotNull { item ->
+                                    (item as? SearchResult.Track)?.song?.let { song ->
+                                        buildString {
+                                            append("{")
+                                            append("\"videoId\":").append(jsonString(song.videoId)).append(",")
+                                            append("\"title\":").append(jsonString(song.title)).append(",")
+                                            append("\"subtitle\":").append(jsonString(song.artist)).append(",")
+                                            append("\"thumbnailUrl\":").append(jsonString(song.thumbnailUrl ?: ""))
+                                            append("}")
                                         }
-                                        arr.put(itemObj)
                                     }
                                 }
-                                sendJsonResponse(writer, arr.toString())
+                                sendJsonResponse(writer, rows.joinToString(",", "[", "]"))
                             }
                         }
                         }
@@ -299,7 +406,7 @@ object TvAuthServer {
 
                     // 4. API: Play Song from Phone Search
                     path == "/api/play" -> {
-                        if (!codeMatches(client, query, requestBody)) {
+                        if (!sessionMatches(cookieHeader)) {
                             sendJsonResponse(writer, """{"error":"unauthorized"}""")
                         } else {
                         val videoId = parseFormParam(requestBody, "videoId") ?: parseQueryParam(query, "videoId")
@@ -315,55 +422,64 @@ object TvAuthServer {
                         }
                     }
 
-                    // 5. Auth Cookie Submission
+                    // 5. Auth Cookie Submission — the terminal act of pairing:
+                    //    the short-lived code is spent here, a long-lived
+                    //    HttpOnly session cookie is minted and sent back, and
+                    //    the pairing code rotates so it can never be replayed.
                     path == "/submit" && method == "POST" -> {
-                        if (!codeMatches(client, query, requestBody)) {
-                            sendHtmlResponse(writer, getAuthHtml(error = "Pairing code did not match the one shown on the TV."))
+                        if (!pairingCodeMatches(client, query, requestBody)) {
+                            sendHtmlResponse(writer, getAuthHtml(error = "Pairing code did not match the one shown on the TV (or it expired). Open the QR again."))
                         } else {
                         val cookieValue = parseCookieFromBody(requestBody)
                         if (!cookieValue.isNullOrBlank()) {
                             onCookieReceived?.invoke(cookieValue)
-                            sendHtmlResponse(writer, getSuccessHtml(pairingCode))
+                            val session = newSessionToken()
+                            sessionToken.set(session)
+                            rotateCode()
+                            sendHtmlResponse(
+                                writer,
+                                getSuccessHtml(),
+                                setCookie = "$SESSION_COOKIE_NAME=$session; Path=/; HttpOnly; SameSite=Lax",
+                            )
                         } else {
                             sendHtmlResponse(writer, getAuthHtml(error = "No cookie detected. Please follow the instructions."))
                         }
                         }
                     }
 
-                    // 6. Mobile Web Remote Control Page (/remote): static
-                    //    content, but every call its JavaScript makes goes
-                    //    through the pairing code below.
-                    path == "/remote" && pairingCode != null && codeMatches(client, query, requestBody) -> {
-                        sendHtmlResponse(writer, getRemoteControlHtml(pairingCode ?: ""))
-                    }
+                    // 6. Mobile Web Remote Control Page (/remote): only for
+                    //    the paired browser; the session cookie proves it.
                     path == "/remote" -> {
-                        sendHtmlResponse(
-                            writer,
-                            getAuthHtml(
-                                error = "Open the remote from the pairing page so it carries the TV's pairing code.",
-                            ),
-                        )
-                    }
-
-                    // 7. Landing page: pairs the browser by carrying the code
-                    //    from the QR through into the form it renders.
-                    path == "/" && query.contains("code") -> {
-                        val given = parseQueryParam(query, "code")
-                        val expected = pairingCode
-                        when {
-                            expected == null -> sendHtmlResponse(writer, getAuthHtml(error = "TV is no longer pairing. Open the QR again."))
-                            given != null && expected == given -> sendHtmlResponse(writer, getAuthHtml(code = given))
-                            given != null -> {
-                                noteFailure(client)
-                                sendHtmlResponse(writer, getAuthHtml(error = "Pairing code did not match the one shown on the TV."))
-                            }
-                            else -> sendHtmlResponse(writer, getAuthHtml(error = "Open the address shown on the TV, including the pairing code."))
+                        if (sessionMatches(cookieHeader)) {
+                            sendHtmlResponse(writer, getRemoteControlHtml())
+                        } else {
+                            sendHtmlResponse(
+                                writer,
+                                getAuthHtml(
+                                    error = "Open the remote from the pairing success page; the TV session lives in this browser's cookies.",
+                                ),
+                            )
                         }
                     }
 
-                    // 7. Static pages (the auth page on its own tells nobody
-                    //    anything, and /remote only works once the caller has
-                    //    the code — every API it calls checks it).
+                    // 7. Landing page: pairs the browser by carrying the code
+                    //    from the QR through into the form it renders. Fresh
+                    //    checks (the window extends while the user is clearly
+                    //    on the page) keep a stale screenshot from pairing.
+                    path == "/" && query.contains("code") -> {
+                        if (pairingCodeState.value == null) {
+                            sendHtmlResponse(writer, getAuthHtml(error = "TV is no longer pairing. Open the QR again."))
+                        } else if (pairingCodeMatches(client, query, "", slideWindow = true)) {
+                            sendHtmlResponse(writer, getAuthHtml(code = pairingCodeState.value))
+                        } else {
+                            sendHtmlResponse(writer, getAuthHtml(error = "Pairing code did not match the one shown on the TV (or it expired). Open the QR again."))
+                        }
+                    }
+
+                    // 8. Static landing page for anyone with neither the code
+                    //    nor a session: the form it shows cannot submit
+                    //    without the hidden pairing code, and API calls are
+                    //    cookie-checked regardless.
                     else -> {
                         sendHtmlResponse(writer, getAuthHtml())
                     }
@@ -379,16 +495,23 @@ object TvAuthServer {
     private fun sendJsonResponse(writer: PrintWriter, json: String) {
         writer.print("HTTP/1.1 200 OK\r\n")
         writer.print("Content-Type: application/json; charset=utf-8\r\n")
-        writer.print("Access-Control-Allow-Origin: *\r\n")
+        // One request per connection: the handler closes the socket right
+        // after writing, and saying so keeps a client from pooling it.
+        writer.print("Connection: close\r\n")
+        // Deliberately no Access-Control-Allow-Origin: the remote page lives
+        // on this origin already, and the missing header is what stops any
+        // other website the phone happens to have open from reading responses.
         writer.print("Content-Length: ${json.toByteArray().size}\r\n")
         writer.print("\r\n")
         writer.print(json)
         writer.flush()
     }
 
-    private fun sendHtmlResponse(writer: PrintWriter, html: String) {
+    private fun sendHtmlResponse(writer: PrintWriter, html: String, setCookie: String? = null) {
         writer.print("HTTP/1.1 200 OK\r\n")
         writer.print("Content-Type: text/html; charset=utf-8\r\n")
+        writer.print("Connection: close\r\n")
+        setCookie?.let { writer.print("Set-Cookie: $it\r\n") }
         writer.print("Content-Length: ${html.toByteArray().size}\r\n")
         writer.print("\r\n")
         writer.print(html)
@@ -413,8 +536,7 @@ object TvAuthServer {
         return parseFormParam(query, param)
     }
 
-    private fun parseCookieFromBody(body: String): String? {
-        if (body.startsWith("cookie=")) {
+    private fun parseCookieFromBody(body: String): String? {        if (body.startsWith("cookie=")) {
             val raw = body.substring("cookie=".length)
             return try {
                 URLDecoder.decode(raw, "UTF-8").trim()
@@ -436,11 +558,55 @@ object TvAuthServer {
         return null
     }
 
+    /**
+     * Quotes a JSON string value. Titles and ids come from YouTube and from
+     * whatever the library holds, so `"`, `\` and control characters have to
+     * be escaped before the value is placed in a document a browser parses.
+     */
+    internal fun jsonString(value: String): String = buildString(value.length + 8) {
+        append('"')
+        for (c in value) {
+            when (c) {
+                '"' -> append("\\\"")
+                '\\' -> append("\\\\")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                '\b' -> append("\\b")
+                '\u000C' -> append("\\f")
+                // U+2028/U+2029 are legal in JSON strings but not in the
+                // JavaScript source the page's inline script is parsed as.
+                '\u2028' -> append("\\u2028")
+                '\u2029' -> append("\\u2029")
+                else -> if (c < ' ') append("\\u%04x".format(c.code)) else append(c)
+            }
+        }
+        append('"')
+    }
+
+    /**
+     * Escapes text that is interpolated into the auth page. The pairing code
+     * is always six digits and the error strings are ours, but this keeps the
+     * templates safe if either ever carries anything less predictable.
+     */
+    internal fun escapeHtml(value: String): String = buildString(value.length) {
+        for (c in value) {
+            when (c) {
+                '&' -> append("&amp;")
+                '<' -> append("&lt;")
+                '>' -> append("&gt;")
+                '"' -> append("&quot;")
+                '\'' -> append("&#39;")
+                else -> append(c)
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // HTML Templates: Apple TV Mobile Remote & Google Sign-In Pages
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun getRemoteControlHtml(code: String): String = """
+    internal fun getRemoteControlHtml(): String = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -527,8 +693,8 @@ body { background: #08080B; color: #FFF; font-family: -apple-system, BlinkMacSys
 </div>
 
 <script>
-const CODE = '$code';
-function withCode(u) { return u + (u.includes('?') ? '&' : '?') + 'code=' + encodeURIComponent(CODE); }
+// Authenticated by the session cookie minted at pairing (HttpOnly), so no
+// token lives in this page or in any URL it builds.
 let dur = 0;
 function fmtTime(ms) {
   if (ms <= 0) return "0:00";
@@ -536,7 +702,7 @@ function fmtTime(ms) {
   return m + ":" + (r < 10 ? "0" : "") + r;
 }
 function updateStatus() {
-  fetch(withCode('/api/status')).then(r => r.json()).then(data => {
+  fetch('/api/status').then(r => r.json()).then(data => {
     document.getElementById('trackTitle').innerText = data.title || "No Song Playing";
     document.getElementById('trackArtist').innerText = data.artist || "BitChord TV";
     let art = document.getElementById('trackArt');
@@ -551,7 +717,7 @@ function updateStatus() {
   }).catch(() => {});
 }
 function sendAction(act, extra = '') {
-  fetch(withCode('/api/action?action=' + act + extra), { method: 'POST' });
+  fetch('/api/action?action=' + act + extra, { method: 'POST' });
   setTimeout(updateStatus, 150);
 }
 function handleSeek(e) {
@@ -560,19 +726,41 @@ function handleSeek(e) {
   let targetMs = Math.floor(pct * dur);
   sendAction('seek', '&ms=' + targetMs);
 }
+// Search rows are built with createElement/textContent: titles and subtitles
+// come from whatever YouTube returns and must land as text, never as markup.
 function searchMusic() {
   let q = document.getElementById('sQuery').value;
   if (!q) return;
-  fetch(withCode('/api/search?q=' + encodeURIComponent(q))).then(r => r.json()).then(items => {
+  fetch('/api/search?q=' + encodeURIComponent(q)).then(r => r.json()).then(items => {
     let container = document.getElementById('sResults');
-    container.innerHTML = '';
+    container.replaceChildren();
     items.forEach(item => {
       let div = document.createElement('div');
       div.className = 'result-item';
-      div.innerHTML = '<img class="result-thumb" src="' + (item.thumbnailUrl || '') + '" /><div class="result-text"><div class="result-title">' + item.title + '</div><div class="result-sub">' + item.subtitle + '</div></div>';
+      let img = document.createElement('img');
+      img.className = 'result-thumb';
+      if (item.thumbnailUrl) img.src = item.thumbnailUrl;
+      let wrap = document.createElement('div');
+      wrap.className = 'result-text';
+      let title = document.createElement('div');
+      title.className = 'result-title';
+      title.textContent = item.title || '';
+      let sub = document.createElement('div');
+      sub.className = 'result-sub';
+      sub.textContent = item.subtitle || '';
+      wrap.appendChild(title);
+      wrap.appendChild(sub);
+      div.appendChild(img);
+      div.appendChild(wrap);
       div.onclick = () => {
-        fetch(withCode('/api/play?videoId=' + encodeURIComponent(item.videoId) + '&title=' + encodeURIComponent(item.title) + '&artist=' + encodeURIComponent(item.subtitle) + '&thumbnailUrl=' + encodeURIComponent(item.thumbnailUrl)), { method: 'POST' });
-        container.innerHTML = '<div style="padding:10px;text-align:center;color:#00E5FF;">Playing ' + item.title + ' on TV!</div>';
+        fetch('/api/play?videoId=' + encodeURIComponent(item.videoId) + '&title=' + encodeURIComponent(item.title || '') + '&artist=' + encodeURIComponent(item.subtitle || '') + '&thumbnailUrl=' + encodeURIComponent(item.thumbnailUrl || ''), { method: 'POST' });
+        container.replaceChildren();
+        let note = document.createElement('div');
+        note.style.padding = '10px';
+        note.style.textAlign = 'center';
+        note.style.color = '#00E5FF';
+        note.textContent = 'Playing ' + (item.title || '') + ' on TV!';
+        container.appendChild(note);
       };
       container.appendChild(div);
     });
@@ -627,9 +815,10 @@ textarea { width: 100%; height: 90px; background: rgba(0,0,0,0.5); border: 1px s
 <div class="card">
   <h2 style="font-size: 17px; font-weight: bold; margin-bottom: 8px;">Direct Session Submission</h2>
   <p style="font-size: 13px; color: #AAA; line-height: 1.4;">Paste your YouTube Music session cookie / headers to immediately log in on TV:</p>
-  ${if (error != null) "<div style='color:#FF375F;font-size:13px;margin-top:8px;'>$error</div>" else ""}
-  ${if (code != null) "<input type='hidden' name='code' value='$code'>" else ""}
+  ${if (error != null) "<div style='color:#FF375F;font-size:13px;margin-top:8px;'>${escapeHtml(error)}</div>" else ""}
+  ${if (code == null) "<p style='font-size:13px;color:#A0A0AB;margin-top:10px;'>This form only works from the pairing link on the TV screen.</p>" else ""}
   <form action="/submit" method="POST">
+    ${if (code != null) "<input type='hidden' name='code' value='${escapeHtml(code)}'>" else ""}
     <textarea name="cookie" placeholder="Paste SAPISID / Session Cookie here..."></textarea>
     <button type="submit" class="btn-primary">Connect Account to TV</button>
   </form>
@@ -638,7 +827,7 @@ textarea { width: 100%; height: 90px; background: rgba(0,0,0,0.5); border: 1px s
 </html>
 """.trimIndent()
 
-    private fun getSuccessHtml(code: String? = null): String = """
+    private fun getSuccessHtml(): String = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -656,7 +845,7 @@ body { background: #08080B; color: #FFF; font-family: -apple-system, sans-serif;
   <div style="font-size: 48px; margin-bottom: 12px;">✅</div>
   <h1 style="font-size: 22px; font-weight: bold; margin-bottom: 8px;">Paired Successfully!</h1>
   <p style="font-size: 14px; color: #AAA;">Your BitChord TV is now connected. You can now use the mobile remote to control playback.</p>
-  <a href="${if (code != null) "/remote?code=$code" else "/remote"}" class="btn">📱 Open TV Remote</a>
+  <a href="/remote" class="btn">📱 Open TV Remote</a>
 </div>
 </body>
 </html>

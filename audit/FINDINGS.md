@@ -2,25 +2,27 @@
 
 Audit artifacts referenced from AUDIT_REPORT.md.
 
-## F-01 Updater lacks APK checksum verification (MEDIUM-LOW)
+## F-01 Updater lacks APK checksum verification (MEDIUM-LOW) — fixed and verified
 - `app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt`
-- Polls `https://api.github.com/repos/kushagrasinghx/BitChord/releases/latest`, downloads the matching `BitChord-*.apk` asset, then hands it to the installer (`REQUEST_INSTALL_PACKAGES` + PackageInstaller/AppUpdateChecker flow). The downloaded bytes are compared against nothing; the platform's install-time signature-continuity check is the only guarantee.
+- Polls `https://api.github.com/repos/kushagrasinghx/BitChord/releases/latest`, downloads the matching `BitChord-*.apk` asset, then hands it to the installer (`REQUEST_INSTALL_PACKAGES` + PackageInstaller/AppUpdateChecker flow). The downloaded bytes were compared against nothing; the platform's install-time signature-continuity check was the only guarantee.
 - Impact: a compromised release asset (leaked token, infrastructure swap) would reach the install prompt; the user's guard is the signing key check, which fails only if the attacker cannot re-sign. No confidentiality impact from taking the download itself.
-- Recommendation: publish a SHA-256 for each release asset and verify it before initiating install; fail closed with a visible error otherwise.
+- **Fix on branch:** CI publishes `BitChord-SHA256SUMS.txt` next to the APKs; the app parses the entry for the exact asset name and streams the download through a `DigestInputStream`. A mismatch deletes the file and reports a failure — nothing reaches the installer. Releases published on/after `2026-12-01` are manifest-mandatory: with no verifiable digest the in-app install path is withheld entirely (`apkUrl = null`, dialog opens the releases page).
+- **Residual:** the manifest lives in the same release as the APK, so it does not defend against an attacker who can replace both. A detached signature over the manifest, with the key held outside CI, is the next step (see FINAL_VERIFICATION.md §8.1).
 
-## F-02 TV LAN auth server is unauthenticated (MEDIUM)
+## F-02 TV LAN auth server is unauthenticated (MEDIUM) — fixed and verified
 - `tv/src/main/java/com/music/bitchord/ui/tv/auth/TvAuthServer.kt`
-- The TV app runs an HTTP server on the LAN (port 8765, pinned else ephemeral) with `Access-Control-Allow-Origin: *`, no authentication, no rate limit, and no pairing token:
+- The TV app ran an HTTP server on the LAN (port 8765, pinned else ephemeral) with `Access-Control-Allow-Origin: *`, no authentication, no rate limit, and no pairing token:
   - `GET /api/status`, `POST /api/action`, `POST /api/play` — full playback control without any proof the caller is the phone app;
-  - `GET /submit` — the phone-side login flow posts the user's YouTube Music cookie here over plaintext LAN HTTP (the TV screen shows a code, but the server never verifies one).
-- Impact: any device on the same LAN can control playback or inject submissions; a passive network observer captures the YouTube authorization cookie exchanged over plaintext HTTP.
-- Recommendation: mint a one-time pairing token displayed on the TV, require it on every endpoint (signature or bearer), stop serving after the auth flow completes, and consider shortening the window further.
+  - `GET /submit` — the phone-side login flow posts the user's YouTube Music cookie here over plaintext LAN HTTP (the TV screen showed a code, but the server never verified one).
+- Impact: any device on the same LAN could control playback or inject submissions; a passive network observer captured the YouTube authorization cookie exchanged over plaintext HTTP.
+- **Fix on branch:** every `/api/*` call and `/remote` requires the `bitchord_tv` session cookie — 128 bits from `SecureRandom`, minted only after a successful pairing, `HttpOnly; SameSite=Lax`, compared with `MessageDigest.isEqual`. `/submit` and the landing page require a live pairing code (10-minute window, rotated on expiry and on use, 30 misses/5 min → 15-min per-IP ban). The `*` CORS header is gone, so other pages on the phone cannot read responses. The remote page no longer embeds the code.
+- **Residual:** `/submit` still carries the YouTube cookie over plaintext LAN HTTP; a passive observer during the pairing moment can read it. Fixing that needs TLS the phone trusts, or a flow where the cookie never leaves the phone (FINAL_VERIFICATION.md §3.3, §8.2).
 
-## F-03 JS string interpolation in QuickJS module calls (LOW-MEDIUM)
+## F-03 JS string interpolation in QuickJS module calls (LOW-MEDIUM) — fixed and verified
 - `app/src/main/java/com/music/bitchord/data/sources/module/ModuleManager.kt:268,314` and `QuickJsExecutor.kt:262,282`
-- Arguments are spliced unescaped into JavaScript source: `args = listOf("\"$query\"", ...)`, `"\"$trackId\""` and `contextArg(...)` which composes `{"$key":{"value":"$value"}}` from raw settings strings. A `"` (or a backslash) inside the search query, a track id, quality string or setting value breaks out of the JS string literal and yields attacker-controlled JS inside the sandboxed QuickJS VM.
-- Impact boundary: the VM exposes only `console` and the `__spine.fetch` HTTP binding; no file, process, or Android APIs, separate OkHttp client without app cookies. No host escape observed in the sandbox setup; injected code is still restricted to module capabilities. Impact is confined to the module's own privileges (network calls with module-scoped first-party-looking context, "search result" fabrication etc.), and it would run in parallel with a legitimate module the user added.
-- Recommendation: JSON-encode every interpolated argument (JSON.stringify semantics) before splicing into source, or pass them via an exposed bindings table instead of source-level interpolation.
+- Arguments were spliced unescaped into JavaScript source: `args = listOf("\"$query\"", ...)`, `"\"$trackId\""` and `contextArg(...)` composed `{"$key":{"value":"$value"}}` from raw settings strings. A `"` (or a backslash) inside the search query, a track id, quality string or setting value broke out of the JS string literal and yielded attacker-controlled JS inside the sandboxed QuickJS VM.
+- Impact boundary: the VM exposes only `console` and the `__spine.fetch` HTTP binding; no file, process, or Android APIs, separate OkHttp client without app cookies. No host escape observed in the sandbox setup; injected code was still restricted to module capabilities. Impact confined to the module's own privileges (network calls with module-scoped first-party-looking context, "search result" fabrication etc.), running in parallel with a legitimate module the user added.
+- **Fix on branch:** `jsStringLiteral` escapes `\ " \n \r \t \b \f`, all other C0 controls as `\uXXXX`, and U+2028/U+2029; every argument to `searchTracks`/`getTrackStreamUrl` (including keys and values in `contextArg`) goes through it. `JsStringLiteralTest` round-trips each escape through a JS-equivalent decoder.
 
 ## F-04 Module assets lack integrity verification (LOW)
 - Homepage: module JS download path (ModuleManager.loadModule) blindly trusts bytes over HTTPS; no checksum/signature. The source index is user-configured (this build ships no default module index URL), and the "app gallery" scheme is used by a user add-module flow — the trust level is explicit user choice.
@@ -50,4 +52,4 @@ Audit artifacts referenced from AUDIT_REPORT.md.
 - `app/src/main/AndroidManifest.xml` exports a Wear MESSAGE_RECEIVED receiver (GMS host route). Standard `com.google.android.gms.wearable` DATA/MESSAGE dispatch; content paths are inside the app's own handling. No change.
 
 ## F-11 Disparate third-party services (INFO)
-- Many lyric/embed/direct-URL helpers ship as plain HTTPS with no auth (`lrclib.net`, `lrc.red`, `api-lyrics.simpmusic.org`, `lyrics-plus-backend.vercel.app`, `unison.boidu.dev`, `lyrics-api.binimum.org`, `lyrics-api.boidu.dev`, musixmatch scraping, kugou, gen­ius web scraping, Apple Music catalog, Discord avatar CDN). These are public/static-style endpoints; no fix.
+- Many lyric/embed/direct-URL helpers ship as plain HTTPS with no auth (`lrclib.net`, `lrc.red`, `api-lyrics.simpmusic.org`, `lyrics-plus-backend.vercel.app`, `unison.boidu.dev`, `lyrics-api.binimum.org`, `lyrics-api.boidu.dev`, musixmatch scraping, kugou, genius web scraping, Apple Music catalog, Discord avatar CDN). These are public/static-style endpoints; no fix.

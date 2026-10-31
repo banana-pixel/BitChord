@@ -1029,14 +1029,15 @@ private fun TvPinDialog(
 @Composable
 private fun TvPhoneSignIn(viewModel: MainViewModel, onBack: () -> Unit) {
     var url by remember { mutableStateOf<String?>(null) }
-    var pairingCode by remember { mutableStateOf<String?>(null) }
+    // Code can rotate while pairing (expiry, or reuse spent on the first
+    // success), so the screen reads it from the server's flow and stays true.
+    val pairingCode by TvAuthServer.pairingCodeState.collectAsState()
     val scope = rememberCoroutineScope()
     DisposableEffect(Unit) {
         scope.launch {
             TvAuthServer.start { cookie ->
                 scope.launch(Dispatchers.Main) { viewModel.onSignedIn(cookie) }
             }?.let { session ->
-                pairingCode = session.code
                 url = "http://${session.ip}:${session.port}/?code=${session.code}"
             }
         }

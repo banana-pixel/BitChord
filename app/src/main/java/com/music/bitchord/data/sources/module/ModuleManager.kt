@@ -373,7 +373,7 @@ class ModuleManager {
      * to a module export goes through here instead, so the argument arrives
      * as data the module reads, no matter what characters it carries.
      */
-    private fun jsStringLiteral(raw: String): String = buildString(raw.length + 8) {
+    internal fun jsStringLiteral(raw: String): String = buildString(raw.length + 8) {
         append('"')
         for (c in raw) {
             when (c) {
@@ -383,7 +383,13 @@ class ModuleManager {
                 '\r' -> append("\\r")
                 '\t' -> append("\\t")
                 '\b' -> append("\\b")
-                '\u000c' -> append("\\u000c")
+                '\u000C' -> append("\\u000c")
+                // ES2019 lets U+2028/U+2029 sit inside string literals, but
+                // escaping them keeps the emitted source valid everywhere the
+                // string is subsequently embedded (HTML templating, older
+                // JSON parsers) at zero semantic cost.
+                '\u2028' -> append("\\u2028")
+                '\u2029' -> append("\\u2029")
                 else -> if (c < ' ') append("\\u%04x".format(c.code)) else append(c)
             }
         }
