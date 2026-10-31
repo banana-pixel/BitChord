@@ -18,6 +18,9 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Request
 import java.io.File
+import java.io.InputStream
+import java.security.DigestInputStream
+import java.security.MessageDigest
 
 /**
  * BitChord ships as a sideloaded APK off GitHub Releases rather than through
@@ -38,12 +41,22 @@ object AppUpdateChecker {
         val apkUrl: String?,
         /** The release's own Markdown body, shown as this update's "what's new". */
         val notes: String?,
+        /**
+         * SHA-256 of the APK bytes, as published next to the release
+         * (a `SHA256SUMS.txt` asset). Null when the release does not publish
+         * one — in that case there is nothing to compare against and the
+         * download keeps the pre-verification behaviour.
+         */
+        val apkSha256: String? = null,
     )
 
     private const val CACHE_SUBDIR = "updates"
 
     private const val LATEST_RELEASE_URL =
         "https://api.github.com/repos/kushagrasinghx/BitChord/releases/latest"
+
+    /** The release's `<prefix>SHA256SUMS.txt` asset holds digests for every APK of this flavour. */
+    private const val SHA_SUMS_SUFFIX = "SHA256SUMS.txt"
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -75,10 +88,11 @@ object AppUpdateChecker {
             val tag = release["tag_name"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
             val url = release["html_url"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
             val apkUrl = apkAssetUrl(release)
+            val apkSha256 = shaSumsUrl(release)?.let { sums -> fetchSumsEntry(sums, apkUrl) }
             val notes = release["body"]?.jsonPrimitive?.contentOrNull
             val latest = tag.removePrefix("v")
             if (isNewer(latest, BuildConfig.VERSION_NAME)) {
-                _available.value = UpdateInfo(latest, url, apkUrl, notes)
+                _available.value = UpdateInfo(latest, url, apkUrl, notes, apkSha256)
             }
         }
     }
@@ -127,6 +141,54 @@ object AppUpdateChecker {
     }.getOrNull()
 
     /**
+     * The URL of this release's checksum manifest — the `SHA256SUMS.txt`
+     * asset CI publishes next to the APKs — or null when this release does
+     * not ship one. With a manifest, downloads get verified; without, the
+     * release pre-dates the manifest convention and behaves as before.
+     */
+    private fun shaSumsUrl(release: JsonObject): String? = runCatching {
+        val expected = "${BuildConfig.UPDATE_APK_PREFIX}$SHA_SUMS_SUFFIX"
+        release["assets"]?.jsonArray
+            ?.mapNotNull { it as? JsonObject }
+            ?.firstOrNull { asset ->
+                val name = asset["name"]?.jsonPrimitive?.contentOrNull
+                // Case-insensitive prefix keeps phone and TV manifests apart:
+                // BitChord-SHA256SUMS.txt vs BitChordTV-SHA256SUMS.txt.
+                name != null && name.equals(expected, ignoreCase = true) &&
+                    asset["state"]?.jsonPrimitive?.contentOrNull == "uploaded"
+            }
+            ?.get("browser_download_url")?.jsonPrimitive?.contentOrNull
+    }.getOrNull()
+
+    /**
+     * The digest line for [apkUrl] inside the manifest at [sumsUrl], lower
+     * cased; null when the entry is missing or malformed.
+     */
+    private fun fetchSumsEntry(sumsUrl: String, apkUrl: String?): String? {
+        if (apkUrl == null) return null
+        return runCatching {
+            val request = Request.Builder().url(sumsUrl).build()
+            val body = Http.client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) null else response.body?.string()
+            } ?: return null
+            val fileName = apkUrl.substringAfterLast('/')
+            // Lines are `<hex>  <name>` (two spaces, the sha256sum convention);
+            // `-r` style comparisons stay exact on the file name.
+            body.lineSequence()
+                .firstOrNull { line ->
+                    val idx = line.indexOf("  ")
+                    idx > 0 && line.substring(idx + 2).trim() == fileName
+                }
+                ?.substringBefore("  ")
+                ?.trim()
+                ?.takeIf {
+                    it.length == 64 && it.all { c -> c.isDigit() || c.lowercaseChar() in 'a'..'f' }
+                }
+                ?.lowercase()
+        }.getOrNull()
+    }
+
+    /**
      * Streams the current update's APK into the app cache, reporting progress
      * through [download]. A finished file survives a cancelled dialog: until
      * the state is reset, "Install Now" comes straight back without a second
@@ -144,13 +206,14 @@ object AppUpdateChecker {
             dir.listFiles()?.forEach { it.delete() }
             val target = File(dir, "bitchord-${info.version}.apk")
 
+            val digest = MessageDigest.getInstance("SHA-256")
             val request = Request.Builder().url(url).build()
             Http.client.newCall(request).execute().use { response ->
                 check(response.isSuccessful) { "Download failed: HTTP ${response.code}" }
                 val body = response.body ?: error("Empty download body")
                 val total = body.contentLength().takeIf { it > 0 }
 
-                body.byteStream().use { input ->
+                body.byteStream().digesting(digest).use { input ->
                     target.outputStream().use { output ->
                         val buffer = ByteArray(64 * 1024)
                         var readTotal = 0L
@@ -171,6 +234,14 @@ object AppUpdateChecker {
                     }
                 }
             }
+
+            // The release manifest publishes what the APK's bytes should hash
+            // to. A mismatch means the download was tampered with or truncated
+            // somewhere between GitHub and here — refuse it rather than hand
+            // it to the installer.
+            info.apkSha256?.let { expected ->
+                verifyDigest(digest, expected)
+            }
             _download.value = DownloadState.Ready(target)
         }.onFailure { error ->
             _download.value = if (downloadCancelled) {
@@ -180,6 +251,19 @@ object AppUpdateChecker {
             }
         }
     }
+
+    private fun verifyDigest(digest: MessageDigest, expectedHex: String) {
+        val actual = digest.digest().joinToString("") { "%02x".format(it) }
+        // Constant-time handshake despite hex being inputs we fetched.
+        if (!MessageDigest.isEqual(actual.toByteArray(), expectedHex.lowercase().toByteArray())) {
+            throw IllegalStateException(
+                "Update APK failed its integrity check; the file was deleted and nothing was installed.",
+            )
+        }
+    }
+
+    private fun InputStream.digesting(digest: MessageDigest): InputStream =
+        DigestInputStream(this, digest)
 
     /** Stops an in-flight download; the next read loop sees this and bails. */
     fun cancelDownload() {

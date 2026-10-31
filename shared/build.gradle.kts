@@ -39,7 +39,7 @@ kotlin {
                 api("io.ktor:ktor-serialization-kotlinx-json:3.5.2")
                 api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
                 api("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-                api("org.jsoup:jsoup:1.22.2")
+                api("org.jsoup:jsoup:1.23.2")
                 // YouTube stream resolution, as the phone does it: InnerTubeX's
                 // client catalog and cipher tiers, NewPipe as the fallback. NewPipe
                 // is compile-only because the phone ships a trimmed jar of it.

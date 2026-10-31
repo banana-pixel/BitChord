@@ -265,7 +265,10 @@ class ModuleManager {
             val result = QuickJsExecutor.callExport(
                 moduleId = loaded.module.id,
                 functionName = "searchTracks",
-                args = listOf("\"$query\"", limit.toString(), contextArg),
+                // String arguments go through jsStringLiteral: a search query
+                // is remote data (song titles contain quotes all the time) and
+                // has to stay a value, never become code inside the VM.
+                args = listOf(jsStringLiteral(query), limit.toString(), contextArg),
             ).getOrThrow()
             json.decodeFromString<ModuleSearchResponse>(result).also {
                 TrackLog.d(TAG, "  ✓ Parsed ${it.tracks.size} tracks (total=${it.total})")
@@ -311,7 +314,7 @@ class ModuleManager {
             val result = QuickJsExecutor.callExport(
                 moduleId = loaded.module.id,
                 functionName = "getTrackStreamUrl",
-                args = listOf("\"$trackId\"", "\"$quality\"", contextArg),
+                args = listOf(jsStringLiteral(trackId), jsStringLiteral(quality), contextArg),
             ).getOrThrow()
             json.decodeFromString<ModuleStreamResponse>(result).also {
                 TrackLog.d(TAG, "  ✓ streamUrl=${it.streamUrl?.take(100) ?: "<none>"} quality=${it.track?.audioQuality}")
@@ -358,7 +361,34 @@ class ModuleManager {
             separator = ",",
             prefix = "{settings:{",
             postfix = "}}",
-        ) { (key, value) -> "\"$key\":{\"value\":\"$value\"}" }
+        ) { (key, value) -> "${jsStringLiteral(key)}:{${jsStringLiteral("value")}:${jsStringLiteral(value)}}" }
+
+    /**
+     * Quotes [raw] as a JavaScript double-quoted string literal.
+     *
+     * Module calls used to splice arguments straight into the evaluated
+     * source, so any quote or backslash inside a query (or a setting value,
+     * or a track id that came from a remote server) let the rest of that
+     * string become executable JS inside the QuickJS VM. Everything passed
+     * to a module export goes through here instead, so the argument arrives
+     * as data the module reads, no matter what characters it carries.
+     */
+    private fun jsStringLiteral(raw: String): String = buildString(raw.length + 8) {
+        append('"')
+        for (c in raw) {
+            when (c) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                '\b' -> append("\\b")
+                '\u000c' -> append("\\u000c")
+                else -> if (c < ' ') append("\\u%04x".format(c.code)) else append(c)
+            }
+        }
+        append('"')
+    }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────
 

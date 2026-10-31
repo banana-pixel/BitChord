@@ -40,11 +40,25 @@ jobs:
     - name: Build Signed Prod Release APK
       run: ./gradlew assembleProdRelease
 
+    # The updater verifies downloaded APKs against this manifest
+    # (AppUpdateChecker.apkSha256); attach it to the GitHub Release next to
+    # the APKs it describes.
+    - name: Generate the SHA256SUMS manifest
+      run: |
+        cd app/build/outputs/apk/prod/release
+        sha256sum *.apk > BitChord-SHA256SUMS.txt
+
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
         name: bitchord-prod-release-signed
         path: app/build/outputs/apk/prod/release/*.apk
+
+    - name: Upload SHA256SUMS Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: bitchord-prod-release-sha256sums
+        path: app/build/outputs/apk/prod/release/BitChord-SHA256SUMS.txt
 
     # Built by the same assembleProdRelease, with the same key. The watch app
     # only pairs with a phone app signed by the same key, so a prod watch APK

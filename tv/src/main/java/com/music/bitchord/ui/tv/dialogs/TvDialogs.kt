@@ -1029,12 +1029,16 @@ private fun TvPinDialog(
 @Composable
 private fun TvPhoneSignIn(viewModel: MainViewModel, onBack: () -> Unit) {
     var url by remember { mutableStateOf<String?>(null) }
+    var pairingCode by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     DisposableEffect(Unit) {
         scope.launch {
             TvAuthServer.start { cookie ->
                 scope.launch(Dispatchers.Main) { viewModel.onSignedIn(cookie) }
-            }?.let { (port, ip) -> url = "http://$ip:$port/" }
+            }?.let { session ->
+                pairingCode = session.code
+                url = "http://${session.ip}:${session.port}/?code=${session.code}"
+            }
         }
         onDispose { TvAuthServer.stop() }
     }
@@ -1058,6 +1062,10 @@ private fun TvPhoneSignIn(viewModel: MainViewModel, onBack: () -> Unit) {
                 TvStep(1, "Connect your phone to the same Wi-Fi as this TV.")
                 TvStep(2, "Scan the code, or open ${url ?: "the address shown here"}.")
                 TvStep(3, "Follow the steps on your phone. This TV signs in by itself.")
+                val shownCode = pairingCode
+                if (shownCode != null) {
+                    TvStep(4, "If the code is asked for on your phone, it is $shownCode.")
+                }
             }
         }
         Spacer(modifier = Modifier.height(24.dp))
