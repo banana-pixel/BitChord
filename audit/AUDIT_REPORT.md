@@ -17,7 +17,7 @@ Everything else observed is low/informational (documented in FINDINGS.md with re
 ## Findings summary (full detail in FINDINGS.md)
 | ID | Area | Severity | Status on branch |
 |---|---|---|---|
-| F-01 | Updater downloads APK with no digest check | MEDIUM-LOW | **Fixed & verified**: verifies against new `BitChord-SHA256SUMS.txt` release asset; manifest-mandatory from 2026-12-01 (fail-closed) |
+| F-01 | Updater downloads APK with no digest check | MEDIUM-LOW | **Fixed & verified**: every in-app install requires a resolved SHA-256 from `BitChord-SHA256SUMS.txt`; all failure modes fail closed to the releases page. No date/tag exception |
 | F-02 | TV LAN server: unauthenticated control + `/submit` cookie over plaintext | MEDIUM | **Fixed & verified**: SecureRandom pairing code (single-use, 10-min) plus `HttpOnly` session cookie checked on every `/api/*` and `/remote`; per-IP miss throttling; `*` CORS removed. Residual: `/submit` still plaintext HTTP |
 | F-03 | Module-call JS string interpolation (search query/settings/trackId) into QuickJS | LOW-MEDIUM | **Fixed & verified**: all arguments pass `jsStringLiteral` (incl. U+2028/2029); VM sandbox boundary unchanged |
 | F-07 | Wrapper jar had no verifiable provenance; distribution zip unverified | LOW | **Fixed & verified**: official 8.11.1 wrapper files + `distributionSha256Sum` pinned |
@@ -31,7 +31,7 @@ Everything else observed is low/informational (documented in FINDINGS.md with re
 
 ## Verification performed on this branch
 - `./gradlew :app:compileProdDebugKotlin :tv:compileProdDebugKotlin :wearos:compileProdDebugKotlin` — pass.
-- `./gradlew :app:testProdDebugUnitTest` — **1130 tests, 0 failures, 0 errors** (1 skipped, pre-existing). Includes the 17 updater-manifest tests and 11 module-escaper tests added in the verification round.
+- `./gradlew :app:testProdDebugUnitTest` — **1156 tests, 0 failures, 0 errors** (1 skipped, pre-existing). Includes 17 updater-manifest parser tests, 26 updater fail-closed gate tests and 11 module-escaper tests.
 - `./gradlew :tv:testProdDebugUnitTest` — **28 tests, 0 failures, 0 errors**, including 12 socket-level tests of the TV pairing/auth server.
 - `./gradlew :app:assembleProdDebug` and `:app:assembleProdRelease` — pass; native libs built per-ABI; R8 completed.
 - Wrapper bootstrap ran under the new `distributionSha256Sum` (verified at download time by Gradle).
@@ -40,15 +40,16 @@ Everything else observed is low/informational (documented in FINDINGS.md with re
 Independent re-testing of each fix, with method and residual limits, is in **`audit/FINAL_VERIFICATION.md`**.
 
 ## Post-fix release artifacts (unsigned — review copies; CI signs releases)
-Built by `:app:assembleProdRelease` on this branch (BUILD SUCCESSFUL, 5m 6s,
-exit 0). Same four lines as `audit/APK_SHA256SUMS.txt`.
+Built by `:app:assembleProdRelease` on this branch (BUILD SUCCESSFUL, 43m 49s,
+exit 0 — full R8 rebuild after the updater correction). Same four lines as
+`audit/APK_SHA256SUMS.txt`.
 
 | APK | SHA-256 |
 |---|---|
-| app-prod-universal-release-unsigned.apk | b8fc63a5d88141fc0b48020105decddf4ff1b2b65c149c74c1357ee09962a050 |
-| app-prod-arm64-v8a-release-unsigned.apk | 362cd4851250bb540593c20ca0471a408958176f9d29f0daf8a72aa5f49b1540 |
-| app-prod-armeabi-v7a-release-unsigned.apk | 02d1af4a1c4c8e8f8e202032056f64c5d7b25fe5c9e0b0cbf7bac92ea4ab2421 |
-| app-prod-x86_64-release-unsigned.apk | 661ae2ed44cdc1dac39b4b33b130c0b35c9a99039547b722dcca4d1badf49bb0 |
+| app-prod-universal-release-unsigned.apk | b590939c64c41dbbf26145504bd14431d08469937c84b32f4998739f5c5f69d7 |
+| app-prod-arm64-v8a-release-unsigned.apk | 82d4f9f693eec086cbb4529d8ed670afcde1599f5b16cb6986079ae01cda1839 |
+| app-prod-armeabi-v7a-release-unsigned.apk | 79298c9f857d63dcb94a527f0164bb1d9c691c7e985f5c96f6b793a93af29477 |
+| app-prod-x86_64-release-unsigned.apk | dc679eb54194bc1cd23258cb2b51cc383c479839548fd613b82054a034bd0c96 |
 
 These are unsigned review artifacts; CI re-signs the same sources with the
 release key, so signed release hashes will differ. APK-level inspection
@@ -57,7 +58,7 @@ updater/escaper code is in the dex) is recorded in `BUILD_PROVENANCE.md` and
 `FINAL_VERIFICATION.md` §7.
 
 ## Residual risks / recommendations (not implemented here)
-1. **Signed update manifest.** The digest now comes from the same GitHub release as the APK, so it stops corruption and single-asset swaps but not an attacker with release write access. Publish a detached signature over `BitChord-SHA256SUMS.txt` (Ed25519/minisign) with a key held outside CI, and embed the public key in the app.
+1. **Signed update manifest.** Checksum verification is not authenticity: the digest comes from the same GitHub release as the APK, so it stops truncation, corruption and single-asset swaps but not an attacker who can write to the release (including the retag-and-swap path — edit an old release, re-upload the APK, rename the tag upward; `published_at` keeps its original value, which is why the date-keyed design was removed). Publish a detached signature over `BitChord-SHA256SUMS.txt` (Ed25519/minisign) with a key held outside CI, and embed the public key in the app.
 2. **HTTPS for `/submit`.** The YouTube cookie still crosses the LAN in plaintext during pairing; terminate TLS with a certificate the phone is taught to trust at pairing, or move the cookie exchange off the network.
 3. Consider `--write-verification-metadata` locking for Gradle dependencies, and/or checksum pinning for the JitPack artifacts and the `zemer-cipher` config fetch (F-04).
 4. Presence opt-out toggle (F-05) — product decision, one line of settings + one condition in `AndroidPresence`.

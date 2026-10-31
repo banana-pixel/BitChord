@@ -14,30 +14,37 @@ checksum pinned), AGP 8.10.1, SDK platform 37 / build-tools 36.0.0.
 
 | # | Claim under test | Method | Result |
 |---|---|---|---|
-| 1 | Updater refuses an APK that does not match the release's `SHA256SUMS` manifest | 17 JVM unit tests over the manifest parser + release-asset selection (`AppUpdateCheckerSumsTest`); code read of the download path | Pass (see §2) |
-| 2 | Updater fails **closed** when a manifest is mandatory but absent | Code read + release-metadata tests | Pass (see §2.3) |
+| 1 | Updater refuses an APK that does not match the release's `SHA256SUMS` manifest | 17 parser tests + 26 fail-closed gate tests (`AppUpdateCheckerSumsTest`, `AppUpdateCheckerGateTest`); code read of the download path | Pass (see §2) |
+| 2 | Updater fails **closed** whenever a digest cannot be resolved — no date/tag exception | Gate tests over every failure mode, including old/future/malformed `published_at` and the retag-and-swap shape | Pass (see §2.3) |
 | 3 | TV LAN server authenticates every state-changing call | 12 JVM tests driving the real server over a loopback socket (`TvAuthServerTest`); code read | Pass (see §3) |
 | 4 | Module arguments cannot escape their JS string literal | 11 JVM tests with a decoder that mirrors the JS parser (`JsStringLiteralTest`) | Pass (see §4) |
 | 5 | TV remote page does not render remote data as HTML | Template assertion + code read of every sink | Pass (see §5) |
-| 6 | No regression in the rest of the app | Full `:app` unit suite, `:tv` unit suite, `:app:assembleProdRelease` | Pass (see §6) |
+| 6 | No regression in the rest of the app | Full `:app` unit suite (1156), `:tv` unit suite (28), `:app:assembleProdRelease` | Pass (see §6) |
 | 7 | Shipped APKs contain the fixed code | `aapt2` badging, `dexdump`/`strings` on the release APK, native-lib listing, hash comparison | Pass (see §7) |
 
 ## 2. Updater integrity (F-01)
 
 ### 2.1 What the code does now
 
-`AppUpdateChecker.check()` reads `published_at` from the GitHub release. A
-release published on or after `2026-12-01T00:00:00Z` is *manifest-mandatory*:
-if no verifiable `<prefix>SHA256SUMS.txt` entry exists for the chosen APK, the
-`UpdateInfo.apkUrl` is set to `null`, so the dialog's "download" button opens
-the releases page instead of handing bytes to the installer. Releases older
-than the cutoff keep the previous behaviour (verify when a manifest exists),
-which is required because already-published releases have no manifest.
+`AppUpdateChecker.check()` resolves a SHA-256 for the chosen APK asset and
+passes it through one decision point:
+
+```kotlin
+internal fun installableApkUrl(apkUrl: String?, digest: String?): String? =
+    apkUrl?.takeIf { digest != null }
+```
+
+A non-null result is the only way the dialog gets a download URL; a null one
+leaves `UpdateInfo.apkUrl` null, and the existing UI opens the releases page.
+There is no release age, version or tag that relaxes this — `published_at` is
+no longer read at all.
 
 `downloadApk()` streams the response through a `DigestInputStream` and, on
-mismatch, deletes the partial file and reports
-`DownloadState.Failed("… integrity check; download discarded, nothing
-installed.")`.
+mismatch **or a missing expected digest**, deletes the partial file and
+reports `DownloadState.Failed(...)`. The null-digest branch is unreachable
+through `check()` by construction; it exists so that state altered after the
+check, or a future caller that skips the gate, still cannot install unverified
+bytes.
 
 ### 2.2 Manifest parsing
 
@@ -58,30 +65,80 @@ short/non-hex digests, comments/blank lines, and an entry embedded mid-line.
 
 ### 2.3 Fail-closed behaviour
 
-- Manifest mandatory + no manifest asset → `apkUrl == null` → no in-app
-  install path.
-- Manifest present + entry missing or ambiguous → `apkSha256 == null` →
-  same.
-- Manifest present + entry found → hash checked during download; mismatch
-  deletes the file.
+Every one of these resolves to no digest, and therefore to the releases page:
 
-**Residual gap (by design, documented):** the manifest is fetched from the
-same GitHub release as the APK. It protects against a corrupted/truncated
-download and against a single-asset swap, but not against an attacker who can
-replace both assets (or who controls the release). That requires a signed
-manifest with a key held outside CI — see §8, item 1. This is a *limitation of
-the fix*, not a regression, and it is materially stronger than the previous
-"no check at all".
+- no `<prefix>SHA256SUMS.txt` asset in the release;
+- the manifest asset exists but is not in the `uploaded` state;
+- more than one asset claims to be the manifest (refused rather than picked);
+- the manifest request returns a non-2xx status or the host is unreachable;
+- the body has no entry for this exact file name (including a TV-manifest
+  digest or a prefix-collision name);
+- the same file name appears with conflicting digests;
+- the digest is malformed, truncated, or not 64 hex characters;
+- the release payload itself cannot be parsed.
 
-### 2.4 CI side
+With a digest resolved, `downloadApk()` hashes the stream and deletes the file
+on mismatch.
+
+### 2.4 The removed date cutoff, and retag-and-swap
+
+An earlier revision of this fix keyed the requirement on
+`published_at >= 2026-12-01T00:00:00Z`. Reviewed on 2026-10-31, that was
+defective:
+
+- **It was a grace period for new releases, not old ones.** `/releases/latest`
+  returns exactly one release, so there was never a set of legacy releases to
+  accommodate — only the one currently on offer. Any release published before
+  the cutoff skipped verification entirely, leaving a month-long window in
+  which the headline fix was inert.
+- **Retag-and-swap.** GitHub does not accept `published_at` on create or
+  update, so it cannot be backdated directly — but it is *preserved* when a
+  release is edited. `PATCH /releases/{id}` accepts `tag_name` and
+  `make_latest`. An attacker with release-write access could therefore pick an
+  existing pre-cutoff release, replace its APK asset with a malicious build,
+  rename its tag upward, and mark it latest: `/releases/latest` returns it,
+  `isNewer` accepts the new tag, `published_at` still reads October, and the
+  date-keyed logic offered it for install with no digest at all.
+- **Missing metadata failed open.** An absent or unparseable `published_at`
+  counted as "legacy", so a GitHub API change would have silently disabled
+  enforcement.
+- **Field mismatch.** `/releases/latest` selects by `created_at`, while the
+  security decision keyed on `published_at` — the field that decides which
+  release you see was not the field that decided whether checks applied.
+
+All four are gone with the date. The gate test class includes an explicit
+old-release, future-release, malformed-date and retag-and-swap case, each
+asserting no install path.
+
+**Residual gap (by design, documented): checksum verification is not
+cryptographic authenticity.** The manifest is fetched from the same GitHub
+release as the APK. It proves the bytes match what that release says they
+should be, which catches truncation, corruption, a failed download and a
+single-asset swap. It does not prove *who* published them: an attacker who can
+write to the release can upload a matching manifest, and the retag-and-swap
+path above shows how cheap that is when the trust boundary is the release
+itself. Closing that requires a detached signature over the manifest, made
+with a key held outside CI and verified against a public key compiled into the
+app — see §8, item 1. That is an architectural change, deliberately not part
+of this correction.
+
+### 2.5 CI side
 
 `.github/workflows/android.yml` generates `BitChord-SHA256SUMS.txt` from the
 release APKs with `sha256sum *.apk` (text mode, two-space separator — matched
-by the parser) and uploads it next to the APKs. The TV workflow (`tv.yml`)
-does not yet publish `BitChordTV-SHA256SUMS.txt`; the parser and prefix logic
-are already flavour-aware, so the TV app will start verifying as soon as that
-asset exists. TV APK assembly was **not** part of this verification round (see
-§9).
+by the parser) and uploads it next to the APKs.
+
+**Release ordering matters now.** Because the requirement is unconditional, the
+first release built from this branch must publish the manifest, or users on the
+new code will be sent to the releases page instead of a one-tap install. The
+safe sequence is: publish 1.8.2 (or the next tag) *with* the manifest; users on
+1.8.1 verify it because they verify when present, and users on this code
+require it and find it. No user ever sees the fallback.
+
+The TV workflow (`tv.yml`) does not publish `BitChordTV-SHA256SUMS.txt`; the
+parser and prefix logic are flavour-aware, so the TV app will require and use
+it as soon as that asset exists. TV APK assembly was **not** part of this round
+(see §9).
 
 ## 3. TV LAN authentication (F-02)
 
@@ -183,7 +240,7 @@ template no longer contains a code constant or code-bearing fetch URLs.
 
 | Suite | Result |
 |---|---|
-| `:app:testProdDebugUnitTest` | 1130 tests, 0 failures, 0 errors, 1 skipped (pre-existing) |
+| `:app:testProdDebugUnitTest` | 1156 tests, 0 failures, 0 errors, 1 skipped (pre-existing) |
 | `:tv:testProdDebugUnitTest` | 28 tests, 0 failures, 0 errors |
 | `:app:compileProdDebugKotlin`, `:tv:compileProdDebugKotlin` | pass |
 | `:app:assembleProdRelease` | pass — 4 ABI APKs produced (see §7) |
@@ -207,13 +264,14 @@ keystore on this host; CI injects the release key). Hashes in
 
 | APK | Bytes | SHA-256 |
 |---|---|---|
-| app-prod-universal-release-unsigned.apk | 171 400 363 | b8fc63a5d88141fc0b48020105decddf4ff1b2b65c149c74c1357ee09962a050 |
-| app-prod-arm64-v8a-release-unsigned.apk | 67 631 557 | 362cd4851250bb540593c20ca0471a408958176f9d29f0daf8a72aa5f49b1540 |
-| app-prod-armeabi-v7a-release-unsigned.apk | 57 818 257 | 02d1af4a1c4c8e8f8e202032056f64c5d7b25fe5c9e0b0cbf7bac92ea4ab2421 |
-| app-prod-x86_64-release-unsigned.apk | 74 224 831 | 661ae2ed44cdc1dac39b4b33b130c0b35c9a99039547b722dcca4d1badf49bb0 |
+| app-prod-universal-release-unsigned.apk | 171 400 363 | b590939c64c41dbbf26145504bd14431d08469937c84b32f4998739f5c5f69d7 |
+| app-prod-arm64-v8a-release-unsigned.apk | 67 631 557 | 82d4f9f693eec086cbb4529d8ed670afcde1599f5b16cb6986079ae01cda1839 |
+| app-prod-armeabi-v7a-release-unsigned.apk | 57 818 257 | 79298c9f857d63dcb94a527f0164bb1d9c691c7e985f5c96f6b793a93af29477 |
+| app-prod-x86_64-release-unsigned.apk | 74 224 831 | dc679eb54194bc1cd23258cb2b51cc383c479839548fd613b82054a034bd0c96 |
 
-Build: `:app:assembleProdRelease` — BUILD SUCCESSFUL in 5m 6s, exit 0, 188
-tasks. `output-metadata.json` lists all four ABI elements at versionCode 29 /
+Build: `:app:assembleProdRelease` — BUILD SUCCESSFUL in 43m 49s, exit 0, 188
+tasks (full R8 rebuild after the updater correction).
+`output-metadata.json` lists all four ABI elements at versionCode 29 /
 versionName 1.8.1.
 
 **These hashes are of the unsigned review APKs.** CI re-signs the same sources
@@ -230,9 +288,10 @@ Checks run against the built APKs:
   `libquickjs.so`, `libconscrypt_jni.so`, `libonnxruntime*.so`,
   `libspake2.so`. Nothing unexpected.
 - **Updater fix is in the APK.** `dexdump` finds `AppUpdateChecker.parseSumsEntry`,
-  `digestMatches` and `shaSumsUrl`; string search finds
-  `BitChord-SHA256SUMS.txt`, `2026-12-01T00:00:00Z` and
-  `Update APK failed its integrity check`.
+  `digestMatches`, `shaSumsUrl` and `apkAssetUrl`; string search finds
+  `BitChord-SHA256SUMS.txt`, `Update APK has no published checksum` and
+  `Update APK failed its integrity check`, and finds **zero** occurrences of
+  the removed `2026-12-01T00:00:00Z` cutoff constant in all four APKs.
 - **Escaper fix is in the APK.** `ModuleManager.jsStringLiteral$app_prodRelease`
   exists with the constant pairs `8232 → "\\u2028"`, `8233 → "\\u2029"`,
   `12 → "\\u000c"`. Call sites found by `dexdump`: the search query

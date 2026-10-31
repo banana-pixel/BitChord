@@ -21,7 +21,6 @@ import java.io.File
 import java.io.InputStream
 import java.security.DigestInputStream
 import java.security.MessageDigest
-import java.time.Instant
 
 /**
  * BitChord ships as a sideloaded APK off GitHub Releases rather than through
@@ -44,9 +43,9 @@ object AppUpdateChecker {
         val notes: String?,
         /**
          * SHA-256 of the APK bytes, as published next to the release
-         * (a `SHA256SUMS.txt` asset). Null when the release does not publish
-         * one — in that case there is nothing to compare against and the
-         * download keeps the pre-verification behaviour.
+         * (a `SHA256SUMS.txt` asset). Null when the release does not publish a
+         * usable one — in that case [apkUrl] is null too, because an
+         * unverifiable APK is never offered for in-app installation.
          */
         val apkSha256: String? = null,
     )
@@ -55,16 +54,6 @@ object AppUpdateChecker {
 
     private const val LATEST_RELEASE_URL =
         "https://api.github.com/repos/kushagrasinghx/BitChord/releases/latest"
-
-    /**
-     * Releases published at or after this instant must ship a checksum
-     * manifest (`<prefix>SHA256SUMS.txt`) for their APK to be offered for
-     * in-app install; older releases predate the convention and stay
-     * verifiable-when-present. Bump only with a CI change to publish
-     * manifests, and only once one release has cut over.
-     */
-    private val MANIFEST_REQUIRED_ON_OR_AFTER: Instant =
-        Instant.parse("2026-12-01T00:00:00Z")
 
     /** The release's `<prefix>SHA256SUMS.txt` asset holds digests for every APK of this flavour. */
     private const val SHA_SUMS_SUFFIX = "SHA256SUMS.txt"
@@ -98,24 +87,29 @@ object AppUpdateChecker {
             val release = json.parseToJsonElement(body) as? JsonObject ?: return@runCatching
             val tag = release["tag_name"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
             val url = release["html_url"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
-            val publishedAt = release["published_at"]?.jsonPrimitive?.contentOrNull
-                ?.let { runCatching { Instant.parse(it) }.getOrNull() }
-            // Releases published before the checksum-manifest convention keep
-            // the old behaviour (verify when a manifest exists); anything from
-            // on or after the cutoff **must** carry a verifiable one or the
-            // in-app installer step is withheld — the dialog falls back to
-            // opening the releases page. A release missing even its
-            // `published_at` counts as legacy rather than blocking the
-            // updater entirely; GitHub always sets it for real releases.
-            val manifestMandatory = publishedAt != null &&
-                !publishedAt.isBefore(MANIFEST_REQUIRED_ON_OR_AFTER)
             val apkUrl = apkAssetUrl(release)
+            // A digest is required for every release, with no date- or
+            // version-based exceptions. Anything that leaves us without one —
+            // no manifest asset, a failed fetch, no entry for this file name,
+            // conflicting entries, malformed metadata — withholds the in-app
+            // install step, and the dialog falls back to the releases page.
+            // Keying this on `published_at` was the earlier design and it was
+            // wrong twice over: it let releases published during the grace
+            // window skip verification entirely, and because GitHub keeps the
+            // original date when a release is edited, an attacker with release
+            // write access could retag and re-upload an old release to land on
+            // the unverified path while still being "the latest".
             val apkSha256 = shaSumsUrl(release)?.let { sums -> fetchSumsEntry(sums, apkUrl) }
             val notes = release["body"]?.jsonPrimitive?.contentOrNull
             val latest = tag.removePrefix("v")
             if (isNewer(latest, BuildConfig.VERSION_NAME)) {
-                val offering = if (manifestMandatory && apkSha256 == null) null else apkUrl
-                _available.value = UpdateInfo(latest, url, offering, notes, apkSha256)
+                _available.value = UpdateInfo(
+                    latest,
+                    url,
+                    installableApkUrl(apkUrl, apkSha256),
+                    notes,
+                    apkSha256,
+                )
             }
         }
     }
@@ -145,7 +139,7 @@ object AppUpdateChecker {
      * [UpdateInfo.apkUrl] null and the UI falls back to opening the releases
      * page.
      */
-    private fun apkAssetUrl(release: JsonObject): String? = runCatching {
+    internal fun apkAssetUrl(release: JsonObject): String? = runCatching {
         val apks = release["assets"]?.jsonArray
             ?.mapNotNull { it as? JsonObject }
             ?.mapNotNull { asset ->
@@ -165,23 +159,41 @@ object AppUpdateChecker {
 
     /**
      * The URL of this release's checksum manifest — the `SHA256SUMS.txt`
-     * asset CI publishes next to the APKs — or null when this release does
-     * not ship one. With a manifest, downloads get verified; without, the
-     * release pre-dates the manifest convention and behaves as before.
+     * asset CI publishes next to the APKs — or null when the release does not
+     * ship exactly one. Null means no in-app install (see [installableApkUrl]).
      */
     internal fun shaSumsUrl(release: JsonObject): String? = runCatching {
         val expected = "${BuildConfig.UPDATE_APK_PREFIX}$SHA_SUMS_SUFFIX"
-        release["assets"]?.jsonArray
+        val urls = release["assets"]?.jsonArray
             ?.mapNotNull { it as? JsonObject }
-            ?.firstOrNull { asset ->
+            ?.mapNotNull { asset ->
                 val name = asset["name"]?.jsonPrimitive?.contentOrNull
                 // Case-insensitive prefix keeps phone and TV manifests apart:
                 // BitChord-SHA256SUMS.txt vs BitChordTV-SHA256SUMS.txt.
-                name != null && name.equals(expected, ignoreCase = true) &&
+                val ours = name != null && name.equals(expected, ignoreCase = true) &&
                     asset["state"]?.jsonPrimitive?.contentOrNull == "uploaded"
+                if (!ours) null else asset["browser_download_url"]?.jsonPrimitive?.contentOrNull
             }
-            ?.get("browser_download_url")?.jsonPrimitive?.contentOrNull
+            .orEmpty()
+            .toSet()
+        // Exactly one manifest. Two assets claiming to be it — even if they
+        // agree today — means the release metadata cannot be trusted to say
+        // which one the digest came from, so refuse rather than pick.
+        urls.singleOrNull()
     }.getOrNull()
+
+    /**
+     * The APK URL to offer for in-app installation, or null to fall back to
+     * the releases page.
+     *
+     * One rule, no exceptions: a URL is only handed to the installer when a
+     * digest was resolved for exactly that asset. Every way of failing to get
+     * one — no manifest asset, two manifest assets, a failed fetch, no entry
+     * for this file name, conflicting entries, malformed metadata — arrives
+     * here as `digest == null` and withholds the download.
+     */
+    internal fun installableApkUrl(apkUrl: String?, digest: String?): String? =
+        apkUrl?.takeIf { digest != null }
 
     /**
      * The digest line for [apkUrl] inside the manifest at [sumsUrl], lower
@@ -284,14 +296,23 @@ object AppUpdateChecker {
             // to. A mismatch means the download was tampered with or truncated
             // somewhere between GitHub and here — discard the file and refuse
             // to offer Install Now rather than hand it to the installer.
-            info.apkSha256?.let { expected ->
-                if (!digestMatches(digest, expected)) {
-                    target.delete()
-                    _download.value = DownloadState.Failed(
-                        "Update APK failed its integrity check; download discarded, nothing installed.",
-                    )
-                    return@withContext
-                }
+            //
+            // A missing digest is treated the same way. check() already
+            // withholds the URL in that case, so reaching here without one
+            // means the state was altered after the fact (or a caller skipped
+            // the gate); either way there is nothing to verify against, and
+            // unverified bytes do not go to the installer.
+            val expected = info.apkSha256
+            if (expected == null || !digestMatches(digest, expected)) {
+                target.delete()
+                _download.value = DownloadState.Failed(
+                    if (expected == null) {
+                        "Update APK has no published checksum; download discarded, nothing installed."
+                    } else {
+                        "Update APK failed its integrity check; download discarded, nothing installed."
+                    },
+                )
+                return@withContext
             }
             _download.value = DownloadState.Ready(target)
         }.onFailure { error ->
