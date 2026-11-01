@@ -389,10 +389,24 @@ object WatchInstaller {
             setApi(Build.VERSION.SDK_INT)
             setTimeout(30, TimeUnit.SECONDS)
             val dir = File(app.noBackupFilesDir, "adb").apply { mkdirs() }
-            val keyFile = File(dir, "adbkey.pk8")
-            val certFile = File(dir, "adbkey.crt")
-            if (keyFile.exists() && certFile.exists()) {
-                key = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(keyFile.readBytes()))
+            val certFile = File(dir, AdbKeyStore.CERT_FILE_NAME)
+            val protector = KeystoreKeyProtector(ADB_KEY_ALIAS)
+            // Null when no identity has been made yet; throws when one exists
+            // but can no longer be read, which must not be replaced silently —
+            // every watch that trusted it would reject a new key.
+            val stored = AdbKeyStore.load(dir, protector)
+            if (stored != null && !certFile.exists()) {
+                // Half an identity: the key is there but its certificate is not.
+                // Minting a replacement would overwrite a key the watch already
+                // trusts, so this is the same re-pair situation as an unreadable
+                // key rather than a fresh install.
+                throw AdbIdentityUnavailableException(
+                    "The saved ADB key has no matching certificate. " +
+                        "Pair the watch again to make a new one.",
+                )
+            }
+            if (stored != null) {
+                key = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(stored))
                 cert = certFile.inputStream().use { CertificateFactory.getInstance("X.509").generateCertificate(it) }
             } else {
                 val pair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
@@ -408,9 +422,18 @@ object WatchInstaller {
                 ).build(JcaContentSignerBuilder("SHA256withRSA").build(pair.private))
                 key = pair.private
                 cert = JcaX509CertificateConverter().getCertificate(holder)
-                keyFile.writeBytes(key.encoded)
+                // Certificate first: a crash between the two then leaves no key
+                // and a stray certificate, which the next launch simply redoes.
+                // The other order would leave a key with no certificate, which
+                // is the re-pair failure above for no reason.
                 certFile.writeBytes(cert.encoded)
+                AdbKeyStore.store(dir, key.encoded, protector)
             }
+        }
+
+        private companion object {
+            /** Keystore alias for the key that seals the ADB private key. */
+            const val ADB_KEY_ALIAS = "bitchord_adb_key"
         }
 
         override fun getPrivateKey(): PrivateKey = key
