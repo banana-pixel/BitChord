@@ -46,6 +46,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -93,6 +94,7 @@ internal fun AudioOutputSheet(
     val outputs = rememberAudioOutputs()
     val cast by PlayerPlatform.host.castState.collectAsStateWithLifecycle()
     val watch by PlayerPlatform.host.watchOutput.collectAsStateWithLifecycle()
+    val outputFormat by PlayerPlatform.host.outputFormat.collectAsStateWithLifecycle()
     // A watch comes and goes; ask again each time the drawer opens.
     LaunchedEffect(Unit) { PlayerPlatform.host.refreshWatchOutput() }
 
@@ -145,7 +147,7 @@ internal fun AudioOutputSheet(
         // broken. The system row above stays — it is the control that does
         // still work for a Cast receiver.
         if (!remoteOutput) {
-            InAppVolumeRow()
+            InAppVolumeRow(available = outputFormat.dspAvailable)
             Spacer(Modifier.height(6.dp))
         }
         AudioPipelineRow(onClick = onOpenPipeline)
@@ -531,7 +533,7 @@ private fun VolumeRow(routeKey: Any, label: String) {
  * than to silence with the handle at zero.
  */
 @Composable
-private fun InAppVolumeRow() {
+private fun InAppVolumeRow(available: Boolean) {
     val level by PlayerSettings.inAppVolume.collectAsStateWithLifecycle()
     val muted by PlayerSettings.inAppVolumeMuted.collectAsStateWithLifecycle()
 
@@ -554,7 +556,7 @@ private fun InAppVolumeRow() {
                 Icon(
                     imageVector = Icons.Rounded.Tune,
                     contentDescription = null,
-                    tint = Color.White.copy(alpha = if (silent) 0.45f else 0.7f),
+                    tint = Color.White.copy(alpha = if (silent || !available) 0.45f else 0.7f),
                     modifier = Modifier.size(20.dp),
                 )
             },
@@ -562,7 +564,7 @@ private fun InAppVolumeRow() {
                 if (muted) Res.string.in_app_volume_muted else Res.string.in_app_volume,
             ),
             value = percentLabel(shown),
-            dimmed = silent,
+            dimmed = silent || !available,
             trailing = {
                 // The flag, not the effective silence: at 0 % the row is
                 // already silent, and a button labelled "Unmute" that set the
@@ -570,12 +572,29 @@ private fun InAppVolumeRow() {
                 // listener with no way back except the slider.
                 MuteButton(
                     muted = muted,
+                    enabled = available,
                     onClick = { PlayerSettings.setInAppVolumeMuted(!muted) },
                 )
             },
         )
+        // The level is a gain inside our DSP chain, so a stream that never
+        // reaches that chain — a passthrough bitstream, or the bit-perfect
+        // output handing samples straight to the DAC — cannot be attenuated
+        // here. Saying so beats a slider that moves and changes no sound.
+        if (!available) {
+            Spacer(Modifier.height(3.dp))
+            Text(
+                text = stringResource(Res.string.in_app_volume_unavailable),
+                style = MaterialTheme.typography.labelMedium,
+                color = Color.White.copy(alpha = 0.45f),
+                modifier = Modifier.padding(start = 32.dp),
+            )
+        }
         Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.alpha(if (available) 1f else 0.4f),
+        ) {
             // The glyph column the system row keeps empty, so the two sliders
             // start and end at the same x.
             Spacer(Modifier.size(20.dp))
@@ -594,6 +613,7 @@ private fun InAppVolumeRow() {
                 onValueChangeFinished = { dragging = false },
                 idleHeight = 6.dp,
                 activeHeight = 10.dp,
+                enabled = available,
                 modifier = Modifier.weight(1f),
             )
         }
@@ -612,7 +632,7 @@ private fun percentLabel(level: Float): String =
 
 /** A speaker glyph that is also the mute switch. */
 @Composable
-private fun MuteButton(muted: Boolean, onClick: () -> Unit) {
+private fun MuteButton(muted: Boolean, enabled: Boolean, onClick: () -> Unit) {
     val haptics = rememberHaptics()
     Icon(
         imageVector = if (muted) {
@@ -623,12 +643,19 @@ private fun MuteButton(muted: Boolean, onClick: () -> Unit) {
         contentDescription = stringResource(
             if (muted) Res.string.in_app_volume_unmute else Res.string.in_app_volume_mute,
         ),
-        tint = Color.White.copy(alpha = if (muted) 0.45f else 0.75f),
+        tint = Color.White.copy(
+            alpha = when {
+                !enabled -> 0.3f
+                muted -> 0.45f
+                else -> 0.75f
+            },
+        ),
         modifier = Modifier
             .size(20.dp)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
+                enabled = enabled,
             ) {
                 haptics.play(if (muted) Haptic.ToggleOn else Haptic.ToggleOff)
                 onClick()

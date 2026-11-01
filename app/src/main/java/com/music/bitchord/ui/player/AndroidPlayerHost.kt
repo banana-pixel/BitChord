@@ -254,7 +254,7 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
  * bit-perfect. On the exclusive output the format is the one written to
  * the DAC, not the ordinary AudioTrack's, which is idle meanwhile.
  */
-private fun AudioOutputStatus.Snapshot.toOutputFormat(bitPerfect: BitPerfectOutput.Status): OutputFormatUi {
+internal fun AudioOutputStatus.Snapshot.toOutputFormat(bitPerfect: BitPerfectOutput.Status): OutputFormatUi {
     val encoding = if (bitPerfect.active) "${bitPerfect.outputBits}-bit PCM" else AudioOutputStatus.encodingLabel(this)
     val rate = (if (bitPerfect.active) bitPerfect.sampleRateHz else actualSampleRateHz)?.takeIf { it > 0 }
     val format = if (rate == null) {
@@ -267,6 +267,11 @@ private fun AudioOutputStatus.Snapshot.toOutputFormat(bitPerfect: BitPerfectOutp
         summary = if (dacLimited) "$format · DAC max" else format,
         bitPerfect = bitPerfect.active && bitPerfect.exact,
         dacLimited = dacLimited,
+        // The sink's own flag covers a passthrough bitstream; the bit-perfect
+        // output never reaches that sink, so its flag would still read true
+        // from the last ordinary track. Both mean the same thing to the UI:
+        // no DSP stage is in the path, so an in-app gain would do nothing.
+        dspAvailable = dspAvailable && !bitPerfect.active,
     )
 }
 

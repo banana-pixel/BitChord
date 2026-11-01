@@ -99,6 +99,13 @@ fun ThinSlider(
     inactiveColor: Color = Color.White.copy(alpha = 0.26f),
     /** Halfway between the two track colours: visible against unplayed, invisible under played. */
     markerColor: Color = Color.White.copy(alpha = 0.5f),
+    /**
+     * Whether the bar takes touches at all. Off while its effect would be
+     * inaudible — the in-app gain with no DSP chain in the path — so the bar
+     * is drawn but does not move under a finger. Callers dim it as well; a
+     * control that still springs when dragged reads as working.
+     */
+    enabled: Boolean = true,
 ) {
     var dragging by remember { mutableStateOf(false) }
     val height by animateDpAsState(
@@ -156,7 +163,8 @@ fun ThinSlider(
             // One gesture loop for both taps and drags. Two separate detectors
             // — a drag one plus a tap one — meant taps never landed: the drag
             // detector took the pointer and a tap has no drag to report.
-            .pointerInput(Unit) {
+            .pointerInput(enabled) {
+                if (!enabled) return@pointerInput
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     dragging = true

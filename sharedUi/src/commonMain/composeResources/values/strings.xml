@@ -10,6 +10,7 @@
     <string name="in_app_volume_muted">App volume muted</string>
     <string name="in_app_volume_mute">Mute app volume</string>
     <string name="in_app_volume_unmute">Unmute app volume</string>
+    <string name="in_app_volume_unavailable">Not available on bit-perfect output</string>
     <string name="system_volume">System volume</string>
     <string name="automix_analysis_status">Automix · this song: %1$s · next: %2$s</string>
     <string name="automix_not_supported_video">Automix not supported on video songs</string>
