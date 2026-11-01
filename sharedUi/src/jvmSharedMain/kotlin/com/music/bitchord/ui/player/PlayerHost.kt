@@ -168,6 +168,16 @@ interface PlayerSettingsSource {
     val hideSongStatus: StateFlow<Boolean>
     val showQueueHistory: StateFlow<Boolean>
     val hideVolumeBar: StateFlow<Boolean>
+
+    /**
+     * The listener's own output level, 0..1, independent of the system media
+     * volume. Read by the DSP chain rather than by the platform — see
+     * [com.music.bitchord.playback.VolumeProcessor] on the phone side.
+     */
+    val inAppVolume: StateFlow<Float>
+
+    /** Whether [inAppVolume] is muted. The level itself is kept while muted. */
+    val inAppVolumeMuted: StateFlow<Boolean>
     /** Hide the device status bar while the player is up. Always false where there is none. */
     val hideStatusBar: StateFlow<Boolean>
     val lastPlayerScreen: StateFlow<LastPlayerScreen>
@@ -195,6 +205,12 @@ interface PlayerSettingsSource {
 
     fun setLastPlayerScreen(value: LastPlayerScreen)
     fun setLyricsOffsetMs(value: Int)
+
+    /** Sets [inAppVolume], clamped by the implementation. */
+    fun setInAppVolume(value: Float)
+
+    /** Mutes or unmutes [inAppVolume], keeping its level for unmuting. */
+    fun setInAppVolumeMuted(value: Boolean)
 }
 
 /** The player's name for the installed host's settings, read where AppSettings used to be. */

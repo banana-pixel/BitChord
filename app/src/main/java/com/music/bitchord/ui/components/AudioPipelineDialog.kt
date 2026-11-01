@@ -64,6 +64,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.music.bitchord.R
 import com.music.bitchord.data.NerdStats
 import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.data.settings.effectiveInAppGain
 import com.music.bitchord.playback.AudioOutputStatus
 import com.music.bitchord.playback.dsd.DsdFilter
 import com.music.bitchord.playback.dsd.DsdFormat
@@ -109,6 +110,7 @@ private fun bitExactVerdict(
     loudnessActive: Boolean,
     eqActive: Boolean,
     spatialActive: Boolean,
+    volumeActive: Boolean,
 ): String = when {
     // Not a fault to fix: there is no DSD output path (native DSD or DoP)
     // here, so the PCM conversion is a deviation every DSD track carries,
@@ -117,6 +119,10 @@ private fun bitExactVerdict(
     loudnessActive -> "No — loudness normalization"
     eqActive -> "No — equalizer"
     spatialActive -> "No — spatial audio"
+    // The app volume is a multiply on the finished signal, so anything below
+    // 100 % is not bit-exact. At 100 % the stage is a bypass and this stays
+    // out of the way — see [com.music.bitchord.playback.VolumeProcessor].
+    volumeActive -> "No — app volume"
     outputExact -> "Yes${outputExactDetail?.let { " ($it)" }.orEmpty()}"
     else -> "No — ${outputExactDetail ?: "converted downstream"}"
 }
@@ -148,6 +154,8 @@ fun AudioPipelineDialog(
     val eqPreset by AppSettings.equalizerPreset.collectAsStateWithLifecycle()
     val spatialAudio by AppSettings.spatialAudio.collectAsStateWithLifecycle()
     val loudnessNormalization by AppSettings.loudnessNormalization.collectAsStateWithLifecycle()
+    val inAppVolume by AppSettings.inAppVolume.collectAsStateWithLifecycle()
+    val inAppVolumeMuted by AppSettings.inAppVolumeMuted.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -428,6 +436,7 @@ fun AudioPipelineDialog(
                         loudnessActive = loudnessNormalization && outputStatus.loudnessGainDb != null,
                         eqActive = eqEnabled,
                         spatialActive = spatialAudio,
+                        volumeActive = effectiveInAppGain(inAppVolume, inAppVolumeMuted) < 1f,
                     ),
                 )
             }

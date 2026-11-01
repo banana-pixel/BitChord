@@ -28,6 +28,7 @@ import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.Speaker
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material.icons.rounded.Usb
 import androidx.compose.material.icons.rounded.Watch
@@ -95,6 +96,11 @@ internal fun AudioOutputSheet(
     // A watch comes and goes; ask again each time the drawer opens.
     LaunchedEffect(Unit) { PlayerPlatform.host.refreshWatchOutput() }
 
+    // True while the sound is coming out of something that is not this phone's
+    // own audio stack. The in-app level is a DSP gain inside our sink, so it
+    // cannot reach either of those outputs.
+    val remoteOutput = cast.connectedName != null || watch.active
+
     PlayerDrawer(
         hazeState = hazeState,
         title = stringResource(Res.string.audio_output),
@@ -128,9 +134,20 @@ internal fun AudioOutputSheet(
         }
 
         Spacer(Modifier.height(10.dp))
-        VolumeRow(routeKey = outputs)
-
+        // The phone's own stream first, then the level inside BitChord. Two
+        // controls rather than one because they are two different things: the
+        // system stream is shared with every other app and moves with the
+        // hardware keys, while this one is this app's own output gain.
+        VolumeRow(routeKey = outputs, label = stringResource(Res.string.system_volume))
         Spacer(Modifier.height(6.dp))
+        // Hidden while a receiver or the watch is the speaker: the audio is not
+        // in this process then, so a gain here would do nothing and read as
+        // broken. The system row above stays — it is the control that does
+        // still work for a Cast receiver.
+        if (!remoteOutput) {
+            InAppVolumeRow()
+            Spacer(Modifier.height(6.dp))
+        }
         AudioPipelineRow(onClick = onOpenPipeline)
     }
 }
@@ -434,7 +451,7 @@ private fun OutputRow(
  * the device list changes rather than in the same breath.
  */
 @Composable
-private fun VolumeRow(routeKey: Any) {
+private fun VolumeRow(routeKey: Any, label: String) {
     val system = PlayerPlatform.host.volume
     val systemLevel by system.level.collectAsStateWithLifecycle()
     var level by remember(system) { mutableFloatStateOf(systemLevel) }
@@ -454,33 +471,206 @@ private fun VolumeRow(routeKey: Any) {
         }
     }
 
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(ROW_SHAPE)
             .background(Color.White.copy(alpha = 0.05f))
-            .padding(horizontal = 16.dp, vertical = 16.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
-        Icon(
-            imageVector = if (level > 0f) Icons.AutoMirrored.Rounded.VolumeUp else Icons.AutoMirrored.Rounded.VolumeOff,
-            contentDescription = null,
-            tint = Color.White.copy(alpha = 0.6f),
-            modifier = Modifier.size(20.dp),
-        )
-        Spacer(Modifier.width(12.dp))
-        ThinSlider(
-            value = level,
-            onValueChange = {
-                dragging = true
-                level = it
-                system.set(it)
+        VolumeLabel(
+            leading = {
+                Icon(
+                    imageVector = if (level > 0f) {
+                        Icons.AutoMirrored.Rounded.VolumeUp
+                    } else {
+                        Icons.AutoMirrored.Rounded.VolumeOff
+                    },
+                    contentDescription = null,
+                    tint = Color.White.copy(alpha = if (level <= 0f) 0.45f else 0.7f),
+                    modifier = Modifier.size(20.dp),
+                )
             },
-            onValueChangeFinished = { dragging = false },
-            idleHeight = 6.dp,
-            activeHeight = 10.dp,
+            label = label,
+            value = percentLabel(level),
+            // The system control has no mute of its own: the hardware keys and
+            // the system panel already own that, and a second one here would be
+            // a third way to change the same number.
+            dimmed = level <= 0f,
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // Same 20dp glyph column as the app row, so the two sliders line
+            // up with each other and with the rows above.
+            Spacer(Modifier.size(20.dp))
+            Spacer(Modifier.width(12.dp))
+            ThinSlider(
+                value = level,
+                onValueChange = {
+                    dragging = true
+                    level = it
+                    system.set(it)
+                },
+                onValueChangeFinished = { dragging = false },
+                idleHeight = 6.dp,
+                activeHeight = 10.dp,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+/**
+ * The level inside BitChord: a gain in our own DSP chain, so it is independent
+ * of the system stream above and of the hardware keys.
+ *
+ * Kept visually parallel to [VolumeRow] — same capsule, same slider, same
+ * glyph column — but distinguished by its glyph (an equaliser rather than a
+ * speaker) and by a mute control the system row does not have. Muting keeps the
+ * slider where the listener left it, so unmuting returns to that level rather
+ * than to silence with the handle at zero.
+ */
+@Composable
+private fun InAppVolumeRow() {
+    val level by PlayerSettings.inAppVolume.collectAsStateWithLifecycle()
+    val muted by PlayerSettings.inAppVolumeMuted.collectAsStateWithLifecycle()
+
+    // Follow the finger exactly while dragging; otherwise read the setting, so
+    // a change made anywhere else (a restore, a future shortcut) shows up here.
+    var dragging by remember { mutableStateOf(false) }
+    var dragLevel by remember { mutableFloatStateOf(level) }
+    val shown = if (dragging) dragLevel else level
+    val silent = muted || shown <= 0f
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(ROW_SHAPE)
+            .background(Color.White.copy(alpha = 0.05f))
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+    ) {
+        VolumeLabel(
+            leading = {
+                Icon(
+                    imageVector = Icons.Rounded.Tune,
+                    contentDescription = null,
+                    tint = Color.White.copy(alpha = if (silent) 0.45f else 0.7f),
+                    modifier = Modifier.size(20.dp),
+                )
+            },
+            label = stringResource(
+                if (muted) Res.string.in_app_volume_muted else Res.string.in_app_volume,
+            ),
+            value = percentLabel(shown),
+            dimmed = silent,
+            trailing = {
+                // The flag, not the effective silence: at 0 % the row is
+                // already silent, and a button labelled "Unmute" that set the
+                // mute flag would do the opposite of what it says and leave the
+                // listener with no way back except the slider.
+                MuteButton(
+                    muted = muted,
+                    onClick = { PlayerSettings.setInAppVolumeMuted(!muted) },
+                )
+            },
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // The glyph column the system row keeps empty, so the two sliders
+            // start and end at the same x.
+            Spacer(Modifier.size(20.dp))
+            Spacer(Modifier.width(12.dp))
+            ThinSlider(
+                value = shown,
+                onValueChange = {
+                    dragging = true
+                    dragLevel = it
+                    // Dragging the handle up from a mute is the obvious way to
+                    // unmute, and the alternative — a slider that moves while
+                    // nothing is heard — reads as broken.
+                    if (muted && it > 0f) PlayerSettings.setInAppVolumeMuted(false)
+                    PlayerSettings.setInAppVolume(it)
+                },
+                onValueChangeFinished = { dragging = false },
+                idleHeight = 6.dp,
+                activeHeight = 10.dp,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+/**
+ * "72 %" — the figures beside a volume row's name.
+ *
+ * Built here rather than through a format argument: Compose's resource lookup
+ * substitutes arguments without running them through `String.format`, so a
+ * literal `%%` in the resource arrives as two percent signs.
+ */
+private fun percentLabel(level: Float): String =
+    "${(level.coerceIn(0f, 1f) * 100).roundToInt()}%"
+
+/** A speaker glyph that is also the mute switch. */
+@Composable
+private fun MuteButton(muted: Boolean, onClick: () -> Unit) {
+    val haptics = rememberHaptics()
+    Icon(
+        imageVector = if (muted) {
+            Icons.AutoMirrored.Rounded.VolumeOff
+        } else {
+            Icons.AutoMirrored.Rounded.VolumeUp
+        },
+        contentDescription = stringResource(
+            if (muted) Res.string.in_app_volume_unmute else Res.string.in_app_volume_mute,
+        ),
+        tint = Color.White.copy(alpha = if (muted) 0.45f else 0.75f),
+        modifier = Modifier
+            .size(20.dp)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) {
+                haptics.play(if (muted) Haptic.ToggleOn else Haptic.ToggleOff)
+                onClick()
+            },
+    )
+}
+
+/**
+ * One line of a volume row: glyph, name, and the level in figures.
+ *
+ * The figures are the point. Two sliders with no numbers are two anonymous
+ * bars, and the listener has no way to tell which one the hardware keys are
+ * moving; a percentage beside each name says it without a paragraph.
+ */
+@Composable
+private fun VolumeLabel(
+    leading: @Composable () -> Unit,
+    label: String,
+    value: String,
+    dimmed: Boolean,
+    trailing: (@Composable () -> Unit)? = null,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) { leading() }
+        Spacer(Modifier.width(12.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyLarge,
+            color = Color.White.copy(alpha = if (dimmed) 0.6f else 0.9f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelMedium,
+            color = Color.White.copy(alpha = 0.55f),
+        )
+        if (trailing != null) {
+            Spacer(Modifier.width(12.dp))
+            Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) { trailing() }
+        }
     }
 }
 

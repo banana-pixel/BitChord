@@ -132,6 +132,7 @@ import com.music.bitchord.data.scrobbling.LastFM
 import com.music.bitchord.data.scrobbling.ListenBrainzManager
 import com.music.bitchord.data.scrobbling.ScrobbleManager
 import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.data.settings.effectiveInAppGain
 import com.music.bitchord.data.settings.EqualizerMode
 import com.music.bitchord.data.settings.OutputPcmMode
 import com.music.bitchord.data.sources.SourceResolver
@@ -602,6 +603,20 @@ class PlaybackService : MediaLibraryService() {
      */
     private val loudnessA = LoudnessProcessor().apply { gainFor = ::loudnessGainFor }
     private val loudnessB = LoudnessProcessor().apply { gainFor = ::loudnessGainFor }
+
+    /**
+     * The listener's own level, one per player for the same reason the other
+     * stages are: a sink owns its own chain, and the two halves of a crossfade
+     * are separate sinks. Both are fed the same value from [observeInAppVolume],
+     * so a blend cannot change level halfway through.
+     *
+     * Held as service fields rather than built inside [buildPlayer] because
+     * [rebuildPlayersForOutput] replaces both players mid-session: a processor
+     * created there would start at unity and the listener's level would jump
+     * back to 100 % on every output switch.
+     */
+    private val volumeProcessorA = VolumeProcessor()
+    private val volumeProcessorB = VolumeProcessor()
     private var loudnessRetryJob: Job? = null
 
     /** The platform audio session currently advertised to system audio tools. */
@@ -1667,11 +1682,18 @@ class PlaybackService : MediaLibraryService() {
         WearBridge.attachStreams(AudioCache.playbackFactory(defaultDataSourceFactory))
 
         configuredFloatOutput = shouldEnableFloatOutput()
+        // Before the players exist: their sinks configure from these processors
+        // on the first track, so the stored level is already in place and the
+        // first block is not played at unity and then corrected.
+        applyInAppVolume(
+            effectiveInAppGain(AppSettings.inAppVolume.value, AppSettings.inAppVolumeMuted.value),
+        )
         val exoPlayer = buildPlayer(
             spatialAudioProcessorA,
             equalizerProcessorA,
             transitionFilterA,
             loudnessA,
+            volumeProcessorA,
             ownsSession = true,
         )
         val sparePlayer = buildPlayer(
@@ -1679,6 +1701,7 @@ class PlaybackService : MediaLibraryService() {
             equalizerProcessorB,
             transitionFilterB,
             loudnessB,
+            volumeProcessorB,
             ownsSession = false,
         )
         player = exoPlayer
@@ -1695,6 +1718,7 @@ class PlaybackService : MediaLibraryService() {
         applySettings(exoPlayer)
         applySettings(sparePlayer)
         observeSettings()
+        observeInAppVolume()
         observeScrobbling()
         observeDiscord()
         watchSleepTimer()
@@ -3190,9 +3214,10 @@ class PlaybackService : MediaLibraryService() {
         equalizer: EqualizerProcessor,
         filter: TransitionFilterProcessor,
         loudness: LoudnessProcessor,
+        volume: VolumeProcessor,
         ownsSession: Boolean,
     ): ExoPlayer = ExoPlayer.Builder(this)
-        .setRenderersFactory(silenceSkippingRenderers(spatial, equalizer, filter, loudness))
+        .setRenderersFactory(silenceSkippingRenderers(spatial, equalizer, filter, loudness, volume))
         .setMediaSourceFactory(requireNotNull(mediaSourceFactory))
         .setLoadControl(farBufferingLoadControl())
         .setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ ownsSession)
@@ -6193,6 +6218,7 @@ class PlaybackService : MediaLibraryService() {
         equalizer: EqualizerProcessor,
         transition: TransitionFilterProcessor,
         loudness: LoudnessProcessor,
+        volume: VolumeProcessor,
     ) = object : DefaultRenderersFactory(this) {
         init {
             // Do not force PCM_FLOAT onto an OEM speaker mixer merely because
@@ -6303,7 +6329,7 @@ class PlaybackService : MediaLibraryService() {
             // them for the same reason: it belongs to the listener and
             // the whole session, while the transition filter belongs to
             // one handoff and has to have the last word on it.
-            val dspChain = DspChain(spatial, equalizer, transition, loudness)
+            val dspChain = DspChain(spatial, equalizer, transition, loudness, volume)
             return PrecisionAudioSink(
                 delegate = defaultSink,
                 dspChain = dspChain,
@@ -6553,6 +6579,7 @@ class PlaybackService : MediaLibraryService() {
             equalizerProcessorA,
             transitionFilterA,
             loudnessA,
+            volumeProcessorA,
             ownsSession = true,
         )
         val newSpare = buildPlayer(
@@ -6560,6 +6587,7 @@ class PlaybackService : MediaLibraryService() {
             equalizerProcessorB,
             transitionFilterB,
             loudnessB,
+            volumeProcessorB,
             ownsSession = false,
         )
         player = newActive
@@ -6646,6 +6674,30 @@ class PlaybackService : MediaLibraryService() {
         player?.let(body)
         spare?.let(body)
     }
+
+    /**
+     * Feeds the listener's level to both players' DSP chains.
+     *
+     * Muting is applied as gain 0 rather than by writing 0 to
+     * [AppSettings.inAppVolume], so the stored level survives a mute — the
+     * setting is what unmuting restores. Both processors are written on every
+     * emission, because whichever one is idle is the player the next crossfade
+     * starts a song on and would otherwise arrive at the old level.
+     *
+     * This only touches two floats; nothing here restarts, seeks or re-buffers
+     * playback, so changing the level mid-track is inaudible apart from the
+     * level itself.
+     */
+    private fun observeInAppVolume() {
+        scope.launch {
+            combine(AppSettings.inAppVolume, AppSettings.inAppVolumeMuted) { level, muted ->
+                effectiveInAppGain(level, muted)
+            }.collect(::applyInAppVolume)
+        }
+    }
+
+    private fun applyInAppVolume(gain: Float) =
+        applyInAppGain(gain, volumeProcessorA, volumeProcessorB)
 
     private fun observeSettings() {
         scope.launch {
@@ -9025,4 +9077,19 @@ class PlaybackService : MediaLibraryService() {
          */
         const val PARTY_QUEUE_ECHO_TIMEOUT_MS = 5_000L
     }
+}
+
+/**
+ * Hands one level to both players' chains.
+ *
+ * Both, always — the idle player is the one the next crossfade starts a song
+ * on, so leaving it on the old level would make the blend change volume halfway
+ * through. The processors are owned by the service rather than by a player
+ * precisely so that [PlaybackService.rebuildPlayersForOutput], which replaces
+ * both players mid-session, hands the replacements the level already in force
+ * instead of starting them at unity.
+ */
+internal fun applyInAppGain(gain: Float, active: VolumeProcessor, spare: VolumeProcessor) {
+    active.setGain(gain)
+    spare.setGain(gain)
 }

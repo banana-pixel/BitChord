@@ -339,6 +339,22 @@ object AppSettings {
     val equalizerPreset = MutableStateFlow(EqualizerPreset.FLAT)
 
     val playbackSpeed = MutableStateFlow(1.0f)
+
+    /**
+     * The listener's own output level, 0..1, applied inside the DSP chain
+     * rather than to the system stream — see
+     * [com.music.bitchord.playback.VolumeProcessor]. Independent of the Android
+     * media volume, so the two controls can be used separately.
+     *
+     * This is the *unmuted* level: muting does not write 0 here, so unmuting
+     * restores whatever the listener last chose rather than needing them to set
+     * it again.
+     */
+    val inAppVolume = MutableStateFlow(1.0f)
+
+    /** Whether the in-app level is muted. [inAppVolume] keeps its value while this is true. */
+    val inAppVolumeMuted = MutableStateFlow(false)
+
     val themeMode = MutableStateFlow(ThemeMode.DARK)
 
     /** Keep playing similar music once the queue runs out. */
@@ -846,6 +862,8 @@ object AppSettings {
         equalizerBands.value = readEqualizerBands()
         equalizerPreset.value = EqualizerPreset.matching(equalizerBands.value)
         playbackSpeed.value = prefs.getFloat(KEY_SPEED, 1.0f)
+        inAppVolume.value = readInAppVolume(prefs)
+        inAppVolumeMuted.value = readInAppVolumeMuted(prefs)
         themeMode.value = runCatching {
             ThemeMode.valueOf(prefs.getString(KEY_THEME, null) ?: "DARK")
         }.getOrDefault(ThemeMode.DARK)
@@ -1203,6 +1221,27 @@ object AppSettings {
     fun setPlaybackSpeed(value: Float) {
         playbackSpeed.value = value
         prefs.edit().putFloat(KEY_SPEED, value).apply()
+    }
+
+    /**
+     * Sets the in-app output level, 0..1.
+     *
+     * Clamped rather than trusted: the value reaches the audio thread, and a
+     * NaN or an out-of-range number there would either silence playback
+     * permanently or be multiplied straight into the samples.
+     */
+    fun setInAppVolume(value: Float) {
+        val stored = writeInAppVolume(prefs, value) ?: return
+        inAppVolume.value = stored
+    }
+
+    /**
+     * Mutes or unmutes the in-app level without disturbing [inAppVolume], which
+     * is what unmuting restores.
+     */
+    fun setInAppVolumeMuted(value: Boolean) {
+        writeInAppVolumeMuted(prefs, value)
+        inAppVolumeMuted.value = value
     }
 
     fun setShowNerdStats(value: Boolean) {
@@ -2104,5 +2143,55 @@ object AppSettings {
     private const val KEY_LAST_VERSION_CODE = "last_version_code"
 }
 
+// ── In-app volume ───────────────────────────────────────────────────────────
+//
+// The two keys and the arithmetic around them live outside the object so the
+// persistence and mute/restore rules can be tested without a Context. The
+// setters and readAll above go through these, so the tests exercise the same
+// code the app runs rather than a copy of it.
 
+private const val KEY_IN_APP_VOLUME = "in_app_volume"
+private const val KEY_IN_APP_VOLUME_MUTED = "in_app_volume_muted"
 
+/**
+ * The stored level, 0..1.
+ *
+ * The finiteness check is not redundant with the clamp: `coerceIn` compares
+ * with `<`/`>`, which are false for NaN, so it returns NaN unchanged rather
+ * than pulling it into range. A corrupted or hand-edited file could otherwise
+ * put a NaN into the slider and the gain.
+ */
+internal fun readInAppVolume(prefs: SharedPreferences): Float {
+    val stored = prefs.getFloat(KEY_IN_APP_VOLUME, 1.0f)
+    return if (stored.isFinite()) stored.coerceIn(0f, 1f) else 1f
+}
+
+internal fun readInAppVolumeMuted(prefs: SharedPreferences): Boolean =
+    prefs.getBoolean(KEY_IN_APP_VOLUME_MUTED, false)
+
+/**
+ * Writes [value] clamped to 0..1 and returns what was stored, or null when the
+ * value is not a number — a NaN would silence playback for good if it reached
+ * the audio thread, so it is refused rather than clamped.
+ */
+internal fun writeInAppVolume(prefs: SharedPreferences, value: Float): Float? {
+    if (!value.isFinite()) return null
+    val clamped = value.coerceIn(0f, 1f)
+    prefs.edit().putFloat(KEY_IN_APP_VOLUME, clamped).apply()
+    return clamped
+}
+
+internal fun writeInAppVolumeMuted(prefs: SharedPreferences, muted: Boolean) {
+    prefs.edit().putBoolean(KEY_IN_APP_VOLUME_MUTED, muted).apply()
+}
+
+/**
+ * The gain the DSP chain should apply: the stored level, or silence while
+ * muted. Muting never writes 0 to the level itself, which is what lets
+ * unmuting restore the listener's own choice.
+ */
+internal fun effectiveInAppGain(level: Float, muted: Boolean): Float {
+    if (muted) return 0f
+    // Same NaN caveat as [readInAppVolume]: coerceIn would let it through.
+    return if (level.isFinite()) level.coerceIn(0f, 1f) else 1f
+}

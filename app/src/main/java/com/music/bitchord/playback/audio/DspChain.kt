@@ -6,36 +6,44 @@ import com.music.bitchord.playback.EqualizerProcessor
 import com.music.bitchord.playback.LoudnessProcessor
 import com.music.bitchord.playback.SpatialAudioProcessor
 import com.music.bitchord.playback.TransitionFilterProcessor
+import com.music.bitchord.playback.VolumeProcessor
 
 /**
  * Composite DSP chain executing BitChord's custom audio processors in their canonical sequence:
  *
  * AudioBlock(Float32) -> SpatialAudioProcessor -> EqualizerProcessor
- *   -> TransitionFilterProcessor -> LoudnessProcessor -> AudioBlock(Float32)
+ *   -> TransitionFilterProcessor -> LoudnessProcessor -> VolumeProcessor
+ *   -> AudioBlock(Float32)
  *
  * Operates purely on in-place Float32 audio blocks without intermediate fixed-point quantization,
  * preserving full dynamic range and headroom.
  *
- * Loudness normalization is the last stage, and per sink on purpose: each
- * player levels the track *it* is playing, so the two sides of a crossfade are
- * each levelled for their own song — see [LoudnessProcessor]. Last because its
- * limiter has to see the signal every other stage has finished shaping.
+ * Loudness normalization is the last *shaping* stage, and per sink on purpose:
+ * each player levels the track *it* is playing, so the two sides of a crossfade
+ * are each levelled for their own song — see [LoudnessProcessor]. There because
+ * its limiter has to see the signal every other stage has finished shaping.
  * That limiter is also the equaliser's: [EqualizerProcessor] only takes back
  * half of a boost, and while it is shaping the signal the limiter stays on.
+ *
+ * The listener's level is last of all — see [VolumeProcessor]. It is a trim on
+ * the finished signal, so it cannot feed back into limiting, cannot clip, and
+ * stays independent of the crossfade's own gain automation on `ExoPlayer`.
  *
  * ## Staying out of the way
  *
  * Every stage here self-bypasses when its own setting is off, returning before
- * it reads a single sample rather than multiplying through by unity. With all
- * three idle the block leaves this class byte-identical to how it arrived,
- * which is what lets [PcmBoundary]'s power-of-two scaling round-trip 16- and
- * 24-bit integers unchanged — see `PrecisionAudioSink.publishOutputExactness`.
+ * it reads a single sample rather than multiplying through by unity — including
+ * the level stage at 100 %. With all of them idle the block leaves this class
+ * byte-identical to how it arrived, which is what lets [PcmBoundary]'s
+ * power-of-two scaling round-trip 16- and 24-bit integers unchanged — see
+ * `PrecisionAudioSink.publishOutputExactness`.
  */
 class DspChain(
     val spatial: SpatialAudioProcessor = SpatialAudioProcessor(),
     val equalizer: EqualizerProcessor = EqualizerProcessor(),
     val transition: TransitionFilterProcessor = TransitionFilterProcessor(),
     val loudness: LoudnessProcessor = LoudnessProcessor(),
+    val volume: VolumeProcessor = VolumeProcessor(),
 ) : FloatAudioProcessor {
 
     private var currentSampleRate: Int = 0
@@ -47,6 +55,7 @@ class DspChain(
         equalizer.configure(sampleRate, channelCount)
         transition.configure(sampleRate, channelCount)
         loudness.configure(sampleRate, channelCount)
+        volume.configure(sampleRate, channelCount)
     }
 
     /** A new track has begun gaplessly on this sink; see [LoudnessProcessor.onStreamBoundary]. */
@@ -67,10 +76,11 @@ class DspChain(
                     val spatialOn = spatial.enabled
                     val eqOn = equalizer.isEnabled
                     val transitionOn = transition.isFiltering
+                    val volumeTarget = volume.target
                     Log.d(
                         TAG,
                         "process() #$count frames=$frames sr=$sr " +
-                            "spatial=$spatialOn eq=$eqOn transition=$transitionOn",
+                            "spatial=$spatialOn eq=$eqOn transition=$transitionOn volume=$volumeTarget",
                     )
                 } catch (_: Throwable) {
                 }
@@ -84,6 +94,7 @@ class DspChain(
         // see; the loudness stage's limiter is what catches whatever survives.
         loudness.holdLimiter = equalizer.isShaping
         loudness.process(block)
+        volume.process(block)
     }
 
     @Suppress("DEPRECATION")
@@ -92,6 +103,7 @@ class DspChain(
         equalizer.flush()
         transition.flush()
         loudness.flush()
+        volume.flush()
     }
 
     override fun reset() {
@@ -100,6 +112,7 @@ class DspChain(
         equalizer.reset()
         transition.reset()
         loudness.reset()
+        volume.reset()
     }
 
     companion object {

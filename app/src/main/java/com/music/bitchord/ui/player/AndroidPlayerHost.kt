@@ -58,6 +58,8 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
         override val hideSongStatus get() = AppSettings.hideSongStatus
         override val showQueueHistory get() = AppSettings.showQueueHistory
         override val hideVolumeBar get() = AppSettings.hideVolumeBar
+        override val inAppVolume get() = AppSettings.inAppVolume
+        override val inAppVolumeMuted get() = AppSettings.inAppVolumeMuted
         override val hideStatusBar get() = AppSettings.hideStatusBarInPlayer
         override val lastPlayerScreen get() = AppSettings.lastPlayerScreen
         override val legacyMeshGradient get() = AppSettings.legacyMeshGradient
@@ -82,6 +84,8 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
 
         override fun setLastPlayerScreen(value: LastPlayerScreen) = AppSettings.setLastPlayerScreen(value)
         override fun setLyricsOffsetMs(value: Int) = AppSettings.setLyricsOffsetMs(value)
+        override fun setInAppVolume(value: Float) = AppSettings.setInAppVolume(value)
+        override fun setInAppVolumeMuted(value: Boolean) = AppSettings.setInAppVolumeMuted(value)
     }
 
     override fun cachedCanvas(song: Song): CanvasArtwork? = CanvasRepository.cached(song)
