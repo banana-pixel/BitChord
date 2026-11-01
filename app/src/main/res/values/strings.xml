@@ -203,6 +203,8 @@
     <string name="replay">Replay</string>
     <string name="replay_subtitle">Your top songs, artists, albums and genres</string>
     <string name="work_out_genres">Work out genres</string>
+    <string name="credentials_unencrypted_title" translatable="false">Credentials not encrypted</string>
+    <string name="credentials_unencrypted_subtitle" translatable="false">This device\'s secure storage is unavailable, so saved sign-ins and passwords may be stored without encryption. They stay on this device and are not included in backups. Signing in again once secure storage works restores encryption.</string>
     <string name="export_data">Export data</string>
     <string name="export_data_subtitle">Settings and listening history, as one JSON file</string>
     <string name="import_data">Import data</string>

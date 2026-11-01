@@ -5,6 +5,9 @@ import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.music.bitchord.data.DebugLog as Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Encrypted preferences that repair themselves when their keyset stops
@@ -37,26 +40,117 @@ internal object EncryptedPrefs {
         opened.getOrPut(name) { resolve(context.applicationContext, name, plainName) }
 
     private fun resolve(context: Context, name: String, plainName: String): SharedPreferences {
-        val encrypted = try {
-            create(context, name)
-        } catch (e: Throwable) {
-            val staleKeyset = isUnverifiable(e) &&
-                context.getSharedPreferences(name, Context.MODE_PRIVATE).contains(KEYSET_ENTRY)
-            if (!staleKeyset) {
-                Log.w(TAG, "EncryptedSharedPreferences unavailable for $name, falling back: ${describe(e)}")
-                return context.getSharedPreferences(plainName, Context.MODE_PRIVATE)
-            }
-            Log.w(TAG, "$name's keyset no longer matches this device's Keystore (${describe(e)}); recreating it")
-            context.deleteSharedPreferences(name)
-            try {
-                create(context, name)
-            } catch (retry: Throwable) {
-                Log.w(TAG, "$name could not be recreated, falling back: ${describe(retry)}")
-                return context.getSharedPreferences(plainName, Context.MODE_PRIVATE)
-            }
+        val decision = decide(
+            name = name,
+            attempt = { create(context, name) as SharedPreferences },
+            // A keyset this device cannot unwrap is recoverable: the ciphertext
+            // was unreadable anyway, so recreating it loses nothing. Only when
+            // the file actually carries that keyset, though — an unavailable
+            // Keystore has no keyset to be stale.
+            staleKeyset = { e ->
+                isUnverifiable(e) &&
+                    context.getSharedPreferences(name, Context.MODE_PRIVATE).contains(KEYSET_ENTRY)
+            },
+            recreate = { context.deleteSharedPreferences(name) },
+        )
+        if (decision is Decision.UsePlain) {
+            return context.getSharedPreferences(plainName, Context.MODE_PRIVATE)
         }
+        val encrypted = (decision as Decision.UseEncrypted).store
         moveIn(context, plainName, encrypted, name)
         return encrypted
+    }
+
+    /**
+     * Whether encrypted storage is currently unavailable and the plain fallback
+     * is in use.
+     *
+     * Surfaced in Settings so a listener can see that credentials are being
+     * written without encryption. The fallback still works — that is the point
+     * of keeping it — but weakening credential storage must not happen silently.
+     * Cleared as soon as a store opens successfully again.
+     */
+    private val _degraded = MutableStateFlow(false)
+    val degraded: StateFlow<Boolean> = _degraded.asStateFlow()
+
+    /**
+     * Which stores are degraded, by name.
+     *
+     * Per store, not a single flag: auth and sources open independently, so a
+     * later healthy store must not clear a warning the earlier one raised. The
+     * public [degraded] is true while any name is in here.
+     */
+    private val degradedNames = mutableSetOf<String>()
+    private val degradedLock = Any()
+
+    /** The outcome of trying to open a store. */
+    internal sealed interface Decision<out T> {
+        data class UseEncrypted<T>(val store: T) : Decision<T>
+        data class UsePlain(val reason: String) : Decision<Nothing>
+    }
+
+    /**
+     * Decides which store [name] resolves to, opening it through [attempt].
+     *
+     * A failure [staleKeyset] recognises is retried once after [recreate],
+     * because that case is recoverable. Any other [Exception] keeps working
+     * through the plain fallback and raises [degraded].
+     *
+     * Errors are deliberately not caught. An `OutOfMemoryError` during Tink
+     * setup is not a reason to start writing credentials in the clear, and
+     * swallowing it would hide a real fault behind a silent downgrade.
+     */
+    internal fun <T> decide(
+        name: String,
+        attempt: () -> T,
+        staleKeyset: (Throwable) -> Boolean,
+        recreate: () -> Unit,
+    ): Decision<T> {
+        try {
+            val store = attempt()
+            markHealthy(name)
+            return Decision.UseEncrypted(store)
+        } catch (e: Exception) {
+            if (!staleKeyset(e)) {
+                Log.w(TAG, "EncryptedSharedPreferences unavailable for $name: ${describe(e)}")
+                return degrade(name, describe(e))
+            }
+            Log.w(TAG, "$name's keyset no longer matches this device's Keystore (${describe(e)}); recreating it")
+        }
+
+        // Recoverable: drop the unreadable keyset and make a new one.
+        recreate()
+        return try {
+            val store = attempt()
+            markHealthy(name)
+            Decision.UseEncrypted(store)
+        } catch (retry: Exception) {
+            Log.w(TAG, "$name could not be recreated: ${describe(retry)}")
+            degrade(name, describe(retry))
+        }
+    }
+
+    private fun degrade(name: String, reason: String): Decision<Nothing> {
+        Log.w(TAG, "$name is being stored unencrypted: $reason")
+        synchronized(degradedLock) {
+            degradedNames += name
+            _degraded.value = true
+        }
+        return Decision.UsePlain(reason)
+    }
+
+    private fun markHealthy(name: String) {
+        synchronized(degradedLock) {
+            if (degradedNames.remove(name)) _degraded.value = degradedNames.isNotEmpty()
+        }
+    }
+
+    /** Test hook: forget every degraded store. */
+    internal fun resetDegradedForTest() {
+        synchronized(degradedLock) {
+            degradedNames.clear()
+            _degraded.value = false
+        }
     }
 
     private fun create(context: Context, name: String): SharedPreferences =

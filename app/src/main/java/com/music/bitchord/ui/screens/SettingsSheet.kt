@@ -77,6 +77,7 @@ import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.WebAssetOff
 import androidx.compose.material.icons.rounded.VolumeUp
+import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material.icons.rounded.Waves
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -247,6 +248,9 @@ fun SettingsScreen(
     val dontRepeatSuggestions by AppSettings.dontRepeatSuggestions.collectAsStateWithLifecycle()
     val preferMusicOnly by AppSettings.preferMusicOnly.collectAsStateWithLifecycle()
     val smartVersionAlignment by AppSettings.smartVersionAlignment.collectAsStateWithLifecycle()
+    // True while the encrypted stores are unavailable and credentials are being
+    // written through the plain fallback; see EncryptedPrefs.
+    val credentialsUnencrypted by com.music.bitchord.auth.EncryptedPrefs.degraded.collectAsStateWithLifecycle()
     val filterNonMusicAudio by AppSettings.filterNonMusicAudio.collectAsStateWithLifecycle()
     val localMusicFolderUri by AppSettings.localMusicFolderUri.collectAsStateWithLifecycle()
     val highPerformanceMode by AppSettings.highPerformanceMode.collectAsStateWithLifecycle()
@@ -1240,6 +1244,19 @@ fun SettingsScreen(
         }
 
         SearchableSettingsGroup(search, header = stringResource(R.string.your_data)) {
+            // Only while it is true: this is a warning about the state of
+            // storage on this device, not a setting, and a permanently visible
+            // "everything is fine" row would be noise.
+            if (credentialsUnencrypted) {
+                val unencryptedTitle = stringResource(R.string.credentials_unencrypted_title)
+                row(unencryptedTitle, "security", "encryption", "keystore", "password", "login") {
+                    SettingsRow(
+                        icon = Icons.Rounded.Warning,
+                        title = unencryptedTitle,
+                        subtitle = stringResource(R.string.credentials_unencrypted_subtitle),
+                    )
+                }
+            }
             val replayTitle = stringResource(R.string.replay)
             row(replayTitle, "stats", "history", "wrapped") {
                 SettingsRow(
