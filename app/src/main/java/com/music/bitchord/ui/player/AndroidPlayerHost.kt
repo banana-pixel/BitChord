@@ -37,6 +37,7 @@ import dev.chrisbanes.haze.HazeState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -166,13 +167,15 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
     }
 
     override val outputFormat: StateFlow<OutputFormatUi> by lazy {
-        combine(AudioOutputStatus.current, BitPerfectOutput.status) { status, bitPerfect ->
-            status.toOutputFormat(bitPerfect)
-        }.stateIn(
-            scope,
-            SharingStarted.Eagerly,
-            AudioOutputStatus.current.value.toOutputFormat(BitPerfectOutput.status.value),
-        )
+        outputFormatFlow(AudioOutputStatus.current, BitPerfectOutput.status, BitPerfectOutput.ready)
+            .stateIn(
+                scope,
+                SharingStarted.Eagerly,
+                AudioOutputStatus.current.value.toOutputFormat(
+                    BitPerfectOutput.status.value,
+                    BitPerfectOutput.ready.value,
+                ),
+            )
     }
 
     override val party: StateFlow<PartyUi> by lazy {
@@ -254,7 +257,18 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
  * bit-perfect. On the exclusive output the format is the one written to
  * the DAC, not the ordinary AudioTrack's, which is idle meanwhile.
  */
-internal fun AudioOutputStatus.Snapshot.toOutputFormat(bitPerfect: BitPerfectOutput.Status): OutputFormatUi {
+internal fun outputFormatFlow(
+    status: Flow<AudioOutputStatus.Snapshot>,
+    bitPerfect: Flow<BitPerfectOutput.Status>,
+    bitPerfectReady: Flow<Boolean>,
+): Flow<OutputFormatUi> = combine(status, bitPerfect, bitPerfectReady) { snapshot, exclusive, ready ->
+    snapshot.toOutputFormat(exclusive, ready)
+}
+
+internal fun AudioOutputStatus.Snapshot.toOutputFormat(
+    bitPerfect: BitPerfectOutput.Status,
+    bitPerfectReady: Boolean,
+): OutputFormatUi {
     val encoding = if (bitPerfect.active) "${bitPerfect.outputBits}-bit PCM" else AudioOutputStatus.encodingLabel(this)
     val rate = (if (bitPerfect.active) bitPerfect.sampleRateHz else actualSampleRateHz)?.takeIf { it > 0 }
     val format = if (rate == null) {
@@ -267,11 +281,14 @@ internal fun AudioOutputStatus.Snapshot.toOutputFormat(bitPerfect: BitPerfectOut
         summary = if (dacLimited) "$format · DAC max" else format,
         bitPerfect = bitPerfect.active && bitPerfect.exact,
         dacLimited = dacLimited,
-        // The sink's own flag covers a passthrough bitstream; the bit-perfect
-        // output never reaches that sink, so its flag would still read true
-        // from the last ordinary track. Both mean the same thing to the UI:
-        // no DSP stage is in the path, so an in-app gain would do nothing.
-        dspAvailable = dspAvailable && !bitPerfect.active,
+        // Three ways the in-app gain has nothing to act on. A passthrough
+        // bitstream never becomes PCM; the exclusive transport is carrying
+        // this track; or the mode is on with its device attached, ready to
+        // take the next lossless one. That last one is what the rest of the
+        // settings screen already treats as "bit-perfect governs this output"
+        // — waiting for the first buffer would leave the row live-looking
+        // whenever playback is paused or the current track is lossy.
+        dspAvailable = dspAvailable && !bitPerfect.active && !bitPerfectReady,
     )
 }
 

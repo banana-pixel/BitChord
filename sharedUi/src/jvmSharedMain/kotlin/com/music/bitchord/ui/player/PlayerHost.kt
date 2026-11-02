@@ -351,14 +351,13 @@ data class OutputFormatUi(
      */
     val dacLimited: Boolean = false,
     /**
-     * Whether this stream passes through the DSP chain at all.
+     * Whether the in-app gain is the control for what is playing.
      *
-     * False in two cases, and both make the in-app gain inert: a passthrough or
-     * offload bitstream, which never becomes PCM for a stage to touch, and the
-     * bit-perfect output, which deliberately hands the decoder's samples to the
-     * DAC unaltered. The equaliser and spatial audio are unavailable for the
-     * same reason; the volume row says so on its own line rather than moving a
-     * slider that changes nothing.
+     * False whenever the bit-perfect output governs this route: its mode is on
+     * with a device attached, or the exclusive transport is already carrying
+     * the track. False too for a passthrough or offload bitstream, which never
+     * becomes PCM for a stage to touch. In each case a gain here would change
+     * nothing, so the volume row dims and says why instead of moving.
      */
     val dspAvailable: Boolean = true,
 )
