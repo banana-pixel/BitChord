@@ -1,0 +1,72 @@
+name: Build ARM64 unsigned production APK
+
+# Fork-specific: build the production ARM64 APK on a hosted x86 runner, with no
+# signing material present. The APK is downloaded and signed locally with the
+# keystore that never leaves the developer machine.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-arm64-unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0" \
+            "ndk;27.0.12077973" \
+            "cmake;3.22.1"
+          # AGP resolves compileSdk 37 as platforms/android-37; the package
+          # installs as android-37.0, exactly as on the build machine.
+          ln -sfn "$ANDROID_HOME/platforms/android-37.0" "$ANDROID_HOME/platforms/android-37"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build unsigned ARM64 prod release
+        run: |
+          ./gradlew :app:assembleProdRelease \
+            -Pandroid.injected.build.abi=arm64-v8a \
+            -Pandroid.injected.testOnly=false \
+            --max-workers=2 \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
+            --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p ci-out
+          find app/build -name 'app-prod-arm64-v8a-release*.apk' \
+            -exec cp -v {} ci-out/ \;
+          test -n "$(ls -A ci-out)"
+          (cd ci-out && sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitchord-arm64-unsigned
+          path: ci-out/*
+          if-no-files-found: error
+          retention-days: 30
