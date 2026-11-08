@@ -57,22 +57,25 @@ jobs:
 
       - name: Build unsigned ARM64 prod release
         run: |
-          ./gradlew :app:assembleProdRelease \
+          ./gradlew :app:assembleProdRelease :wearos:assembleProdRelease \
             -Pandroid.injected.build.abi=arm64-v8a \
             -Pandroid.injected.testOnly=false \
+            -Pbitchord.bundleWear=false \
             --max-workers=2 \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
             --stacktrace
 
-      - name: Collect APK
+      - name: Collect APKs
         run: |
           mkdir -p ci-out
           find app/build -name 'app-prod-arm64-v8a-release*.apk' \
             -exec cp -v {} ci-out/ \;
+          find wearos/build -name '*prod-release*.apk' \
+            -exec cp -v {} ci-out/ \;
           test -n "$(ls -A ci-out)"
           (cd ci-out && sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
 
-      - name: Upload APK
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: bitchord-arm64-unsigned
