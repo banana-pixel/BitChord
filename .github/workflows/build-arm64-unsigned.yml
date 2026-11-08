@@ -55,12 +55,22 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build unsigned ARM64 prod release
+      - name: Build unsigned ARM64 phone release
         run: |
-          ./gradlew :app:assembleProdRelease :wearos:assembleProdRelease \
+          ./gradlew :app:assembleProdRelease \
             -Pandroid.injected.build.abi=arm64-v8a \
             -Pandroid.injected.testOnly=false \
             -Pbitchord.bundleWear=false \
+            --max-workers=2 \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
+            --stacktrace
+
+      - name: Build unsigned watch release
+        run: |
+          # No ABI filter: the watch APK must carry every ABI the device fleet
+          # supports, not just the phone's arm64-v8a.
+          ./gradlew :wearos:assembleProdRelease \
+            -Pandroid.injected.testOnly=false \
             --max-workers=2 \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
             --stacktrace
