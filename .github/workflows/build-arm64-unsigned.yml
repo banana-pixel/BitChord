@@ -28,8 +28,17 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Configure Android SDK
+        run: |
+          SDK=/usr/local/lib/android/sdk
+          test -d "$SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          TOOLS="$SDK/cmdline-tools/latest/bin"
+          if [ ! -x "$TOOLS/sdkmanager" ]; then
+            TOOLS=$(dirname "$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -1)")
+          fi
+          echo "$TOOLS" >> "$GITHUB_PATH"
 
       - name: Install SDK packages
         run: |
